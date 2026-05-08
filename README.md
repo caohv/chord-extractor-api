@@ -34,6 +34,7 @@ Response 200:
 ```json
 {
   "duration": 217.34,
+  "bpm": 120.5,
   "chords": [
     { "chord": "N", "timestamp": 0.0 },
     { "chord": "C", "timestamp": 0.74 },
@@ -41,6 +42,17 @@ Response 200:
   ]
 }
 ```
+
+`bpm` is estimated with `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe (faster than `librosa.load`).
+
+### `POST /bpm`
+Same body as `/extract`. Returns only tempo. Decodes the first 60 s of audio (full audio download is unavoidable for YouTube; for direct URLs the full file is fetched but only 60 s is decoded).
+
+```json
+{ "duration": 217.34, "bpm": 120.5 }
+```
+
+Use this when you only need tempo — typically ~5x faster than `/extract` because Chordino is skipped.
 
 Supported direct-URL audio formats: `mp3`, `wav`, `ogg`, `flac`, `m4a`, `webm`. Hard limit 100 MB per file (applies to both direct URLs and YouTube downloads).
 
