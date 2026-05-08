@@ -20,6 +20,7 @@ uvicorn = { version = "*", extras = ["standard"] }
 httpx = "*"
 soundfile = "*"
 pydantic = ">=2"
+yt-dlp = "*"
 
 [pypi-options]
 no-build-isolation = ["vamp"]
