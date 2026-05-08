@@ -12,4 +12,10 @@ class Chord(BaseModel):
 
 class ExtractResponse(BaseModel):
     duration: float
+    bpm: float
     chords: list[Chord]
+
+
+class BpmResponse(BaseModel):
+    duration: float
+    bpm: float
