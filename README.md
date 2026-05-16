@@ -34,7 +34,8 @@ Response 200:
 ```json
 {
   "duration": 217.34,
-  "bpm": 120.5,
+  "bpm": 80.75,
+  "bpm_raw": 161.5,
   "chords": [
     { "chord": "N", "timestamp": 0.0 },
     { "chord": "C", "timestamp": 0.74 },
@@ -43,16 +44,33 @@ Response 200:
 }
 ```
 
-`bpm` is estimated with `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe (faster than `librosa.load`).
+`bpm_raw` is the value returned by `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe. `bpm` applies a tempo-octave normalization that halves/doubles until the value falls in `[60, 140]`, since beat trackers commonly report the double-time of a ballad's perceived tempo. Genuinely fast tracks (≈150–180 BPM drum & bass, hardcore) will be over-halved by this rule; use `bpm_raw` to detect and override.
 
 ### `POST /bpm`
 Same body as `/extract`. Returns only tempo. Decodes the first 60 s of audio (full audio download is unavoidable for YouTube; for direct URLs the full file is fetched but only 60 s is decoded).
 
 ```json
-{ "duration": 217.34, "bpm": 120.5 }
+{ "duration": 217.34, "bpm": 80.75, "bpm_raw": 161.5 }
 ```
 
 Use this when you only need tempo — typically ~5x faster than `/extract` because Chordino is skipped.
+
+### `POST /meter`
+Same body as `/extract`. Detects time signature and downbeat positions using madmom's `RNNDownBeatProcessor` + `DBNDownBeatTrackingProcessor`. Decodes the full audio. Considers `beats_per_bar ∈ {3, 4, 6}` and lets the DBN pick.
+
+```json
+{
+  "duration": 219.13,
+  "beats_per_bar": 3,
+  "time_signature": "3/4",
+  "confidence": 1.0,
+  "downbeats": [0.92, 2.55, 4.24, 5.92]
+}
+```
+
+Mapping: `3 → 3/4` (simple triple), `4 → 4/4` (simple quadruple), `6 → 6/8` (compound duple). Note: 6/8 vs 3/4 is genuinely ambiguous from beat tracking alone; madmom's RNN trained on annotated data usually picks correctly but isn't perfect.
+
+This endpoint runs an RNN forward pass over the full audio and is the slowest of the three (~5–10 s on native amd64, longer under emulation).
 
 Supported direct-URL audio formats: `mp3`, `wav`, `ogg`, `flac`, `m4a`, `webm`. Hard limit 100 MB per file (applies to both direct URLs and YouTube downloads).
 

@@ -13,9 +13,19 @@ class Chord(BaseModel):
 class ExtractResponse(BaseModel):
     duration: float
     bpm: float
+    bpm_raw: float
     chords: list[Chord]
 
 
 class BpmResponse(BaseModel):
     duration: float
     bpm: float
+    bpm_raw: float
+
+
+class MeterResponse(BaseModel):
+    duration: float
+    beats_per_bar: int
+    time_signature: str
+    confidence: float
+    downbeats: list[float]
