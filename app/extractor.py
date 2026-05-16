@@ -40,30 +40,11 @@ def _beat_track(y: np.ndarray) -> float:
     return round(float(np.atleast_1d(tempo)[0]), 2)
 
 
-def _perceptual_bpm(bpm: float, low: float = 60.0, high: float = 140.0) -> float:
-    """Collapse tempo-octave errors into a perceptual range.
-
-    Beat trackers often return 2x (or rarely 1/2x) of the human-felt tempo —
-    e.g. a 80 BPM ballad gets reported as 160. Halve/double until the result
-    falls in [low, high] when possible. Caveat: genuinely fast songs (drum &
-    bass, hardcore, ~150-180 BPM) will be over-halved by this rule; callers
-    that care should inspect `bpm_raw` and override.
-    """
-    if bpm <= 0:
-        return bpm
-    while bpm > high and bpm / 2 >= low:
-        bpm /= 2
-    while bpm < low and bpm * 2 <= high:
-        bpm *= 2
-    return round(bpm, 2)
-
-
 def extract_bpm(audio_path: str) -> dict:
     duration = _probe_duration(audio_path)
     sample = BPM_SAMPLE_SECONDS if duration > BPM_SAMPLE_SECONDS else None
     y = _decode_pcm(audio_path, sample)
-    raw = _beat_track(y)
-    return {"duration": duration, "bpm": _perceptual_bpm(raw), "bpm_raw": raw}
+    return {"duration": duration, "bpm": _beat_track(y)}
 
 
 def _patch_madmom_compat() -> None:
@@ -163,12 +144,11 @@ def extract_chords(audio_path: str) -> dict:
 
     duration = _probe_duration(audio_path)
     y = _decode_pcm(audio_path)
-    raw_bpm = _beat_track(y)
+    bpm = _beat_track(y)
 
     return {
         "duration": duration,
-        "bpm": _perceptual_bpm(raw_bpm),
-        "bpm_raw": raw_bpm,
+        "bpm": bpm,
         "chords": [
             {"chord": c.chord, "timestamp": float(c.timestamp)}
             for c in raw

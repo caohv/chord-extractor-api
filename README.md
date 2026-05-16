@@ -34,8 +34,7 @@ Response 200:
 ```json
 {
   "duration": 217.34,
-  "bpm": 80.75,
-  "bpm_raw": 161.5,
+  "bpm": 120.5,
   "chords": [
     { "chord": "N", "timestamp": 0.0 },
     { "chord": "C", "timestamp": 0.74 },
@@ -44,13 +43,13 @@ Response 200:
 }
 ```
 
-`bpm_raw` is the value returned by `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe. `bpm` applies a tempo-octave normalization that halves/doubles until the value falls in `[60, 140]`, since beat trackers commonly report the double-time of a ballad's perceived tempo. Genuinely fast tracks (≈150–180 BPM drum & bass, hardcore) will be over-halved by this rule; use `bpm_raw` to detect and override.
+`bpm` is the raw value from `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe. Beat trackers don't disambiguate tempo octaves — a 80 BPM ballad with busy ornamentation may be reported as 160 BPM, and genuinely fast 170 BPM tracks land at 170. Callers that need a perceptual tempo should pick between `bpm / 2`, `bpm`, and `bpm * 2` based on their own heuristic.
 
 ### `POST /bpm`
 Same body as `/extract`. Returns only tempo. Decodes the first 60 s of audio (full audio download is unavoidable for YouTube; for direct URLs the full file is fetched but only 60 s is decoded).
 
 ```json
-{ "duration": 217.34, "bpm": 80.75, "bpm_raw": 161.5 }
+{ "duration": 217.34, "bpm": 120.5 }
 ```
 
 Use this when you only need tempo — typically ~5x faster than `/extract` because Chordino is skipped.
