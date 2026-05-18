@@ -10,8 +10,13 @@ from .downloader import (
     UnsupportedFormatError,
     download_to_temp,
 )
-from .extractor import extract_bpm, extract_chords
-from .schemas import BpmResponse, ExtractRequest, ExtractResponse
+from .extractor import extract_bpm, extract_chords, extract_meter
+from .schemas import (
+    BpmResponse,
+    ExtractRequest,
+    ExtractResponse,
+    MeterResponse,
+)
 
 logger = logging.getLogger("chord-extractor-api")
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +45,15 @@ async def bpm(req: ExtractRequest) -> BpmResponse:
     async with download_to_temp(url) as path:
         result = await run_in_threadpool(extract_bpm, path)
     return BpmResponse(**result)
+
+
+@app.post("/meter", response_model=MeterResponse)
+async def meter(req: ExtractRequest) -> MeterResponse:
+    url = str(req.url)
+    logger.info("meter requested url=%s", url)
+    async with download_to_temp(url) as path:
+        result = await run_in_threadpool(extract_meter, path)
+    return MeterResponse(**result)
 
 
 @app.exception_handler(UnsupportedFormatError)

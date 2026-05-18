@@ -12,6 +12,7 @@ libsndfile = "*"
 numpy = "<2"
 setuptools = "<81"
 wheel = "*"
+cython = "*"
 
 [pypi-dependencies]
 chord-extractor = "*"
@@ -21,9 +22,10 @@ httpx = "*"
 pydantic = ">=2"
 yt-dlp = "*"
 librosa = "*"
+madmom = "*"
 
 [pypi-options]
-no-build-isolation = ["vamp"]
+no-build-isolation = ["vamp", "madmom"]
 
 [feature.dev.pypi-dependencies]
 pytest = "*"

@@ -43,7 +43,7 @@ Response 200:
 }
 ```
 
-`bpm` is estimated with `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe (faster than `librosa.load`).
+`bpm` is the raw value from `librosa.beat.beat_track` on a 22.05 kHz mono mixdown decoded via `ffmpeg` pipe. Beat trackers don't disambiguate tempo octaves — a 80 BPM ballad with busy ornamentation may be reported as 160 BPM, and genuinely fast 170 BPM tracks land at 170. Callers that need a perceptual tempo should pick between `bpm / 2`, `bpm`, and `bpm * 2` based on their own heuristic.
 
 ### `POST /bpm`
 Same body as `/extract`. Returns only tempo. Decodes the first 60 s of audio (full audio download is unavoidable for YouTube; for direct URLs the full file is fetched but only 60 s is decoded).
@@ -53,6 +53,23 @@ Same body as `/extract`. Returns only tempo. Decodes the first 60 s of audio (fu
 ```
 
 Use this when you only need tempo — typically ~5x faster than `/extract` because Chordino is skipped.
+
+### `POST /meter`
+Same body as `/extract`. Detects time signature and downbeat positions using madmom's `RNNDownBeatProcessor` + `DBNDownBeatTrackingProcessor`. Decodes the full audio. Considers `beats_per_bar ∈ {3, 4, 6}` and lets the DBN pick.
+
+```json
+{
+  "duration": 219.13,
+  "beats_per_bar": 3,
+  "time_signature": "3/4",
+  "confidence": 1.0,
+  "downbeats": [0.92, 2.55, 4.24, 5.92]
+}
+```
+
+Mapping: `3 → 3/4` (simple triple), `4 → 4/4` (simple quadruple), `6 → 6/8` (compound duple). Note: 6/8 vs 3/4 is genuinely ambiguous from beat tracking alone; madmom's RNN trained on annotated data usually picks correctly but isn't perfect.
+
+This endpoint runs an RNN forward pass over the full audio and is the slowest of the three (~5–10 s on native amd64, longer under emulation).
 
 Supported direct-URL audio formats: `mp3`, `wav`, `ogg`, `flac`, `m4a`, `webm`. Hard limit 100 MB per file (applies to both direct URLs and YouTube downloads).
 

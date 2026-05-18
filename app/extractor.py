@@ -47,6 +47,97 @@ def extract_bpm(audio_path: str) -> dict:
     return {"duration": duration, "bpm": _beat_track(y)}
 
 
+def _patch_madmom_compat() -> None:
+    # madmom 0.16.1 still references stdlib/numpy names that were removed in
+    # Python 3.10 and numpy >=1.20/1.24. Patch them before importing madmom.
+    import collections
+    import collections.abc as cabc
+
+    for name in (
+        "MutableSequence",
+        "MutableMapping",
+        "Mapping",
+        "Iterable",
+        "Sequence",
+        "Set",
+        "Callable",
+    ):
+        if not hasattr(collections, name) and hasattr(cabc, name):
+            setattr(collections, name, getattr(cabc, name))
+
+    if not hasattr(np, "float"):
+        np.float = float  # type: ignore[attr-defined]
+    if not hasattr(np, "int"):
+        np.int = int  # type: ignore[attr-defined]
+
+    # numpy >=1.24 raises on inhomogeneous lists in np.asarray; madmom relies
+    # on the old object-array fallback. Wrap np.asarray once.
+    if not getattr(np, "_madmom_asarray_patched", False):
+        _orig = np.asarray
+
+        def _patched(a, dtype=None, order=None):  # type: ignore[no-untyped-def]
+            try:
+                return _orig(a, dtype=dtype, order=order)
+            except ValueError:
+                return _orig(a, dtype=object)
+
+        np.asarray = _patched  # type: ignore[assignment]
+        np._madmom_asarray_patched = True  # type: ignore[attr-defined]
+
+
+def extract_meter(audio_path: str) -> dict:
+    # madmom imports are slow; import lazily so /health and other endpoints
+    # don't pay the cost.
+    _patch_madmom_compat()
+
+    from madmom.features.downbeats import (
+        DBNDownBeatTrackingProcessor,
+        RNNDownBeatProcessor,
+    )
+
+    duration = _probe_duration(audio_path)
+
+    act = RNNDownBeatProcessor()(audio_path)
+    proc = DBNDownBeatTrackingProcessor(beats_per_bar=[3, 4, 6], fps=100)
+    beats = proc(act)  # shape (N, 2): [timestamp, position_in_bar]
+
+    if len(beats) == 0:
+        return {
+            "duration": duration,
+            "beats_per_bar": 0,
+            "time_signature": "unknown",
+            "confidence": 0.0,
+            "downbeats": [],
+        }
+
+    positions = [int(round(p)) for _, p in beats]
+    # madmom's DBN outputs positions in 1..K where K is the beats_per_bar it
+    # selected from the candidates passed to DBNDownBeatTrackingProcessor.
+    beats_per_bar = max(positions)
+    # 6 beats/bar in DBN ≈ 6/8 (compound duple); 3 → 3/4; 4 → 4/4.
+    ts_map = {3: "3/4", 4: "4/4", 6: "6/8"}
+    time_signature = ts_map.get(beats_per_bar, f"{beats_per_bar}/4")
+
+    downbeats = [float(t) for t, p in beats if int(round(p)) == 1]
+    # Confidence: ratio of detected downbeats vs the count expected for a
+    # perfectly regular cycle of length `beats_per_bar`. Capped at 1.0; an
+    # extra leading/trailing downbeat can otherwise nudge it slightly over.
+    expected_bars = len(beats) / beats_per_bar
+    confidence = (
+        round(min(len(downbeats) / expected_bars, 1.0), 3)
+        if expected_bars
+        else 0.0
+    )
+
+    return {
+        "duration": duration,
+        "beats_per_bar": beats_per_bar,
+        "time_signature": time_signature,
+        "confidence": confidence,
+        "downbeats": downbeats,
+    }
+
+
 def extract_chords(audio_path: str) -> dict:
     chordino = Chordino(roll_on=1)
     raw = chordino.extract(audio_path)

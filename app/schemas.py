@@ -19,3 +19,11 @@ class ExtractResponse(BaseModel):
 class BpmResponse(BaseModel):
     duration: float
     bpm: float
+
+
+class MeterResponse(BaseModel):
+    duration: float
+    beats_per_bar: int
+    time_signature: str
+    confidence: float
+    downbeats: list[float]
