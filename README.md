@@ -74,7 +74,7 @@ Mapping: `3 → 3/4` (simple triple), `4 → 4/4` (simple quadruple), `6 → 6/8
 This endpoint runs an RNN forward pass over the full audio and is the slowest of the three (~5–10 s on native amd64, longer under emulation).
 
 ### `POST /sections`
-Same body as `/extract`. Runs music structure analysis with [`allin1`](https://github.com/mir-aidj/all-in-one) (state-of-the-art ISMIR 2023 model). Returns functional segments labeled `intro`, `verse`, `chorus`, `bridge`, `inst`, `solo`, `break`, `outro` (the raw `start`/`end` silence markers are dropped). Pipeline per request: Demucs source separation (hdemucs_mmi — allin1's default htdemucs is monkey-patched out for ~2× CPU speedup at similar memory footprint) → spectrogram extraction → neighborhood-attention transformer → boundary detection + label classification.
+Same body as `/extract`. Optional query param `?lyrics=true` to additionally transcribe and align lyrics (see "Lyrics opt-in" below). Runs music structure analysis with [`allin1`](https://github.com/mir-aidj/all-in-one) (state-of-the-art ISMIR 2023 model). Returns functional segments labeled `intro`, `verse`, `chorus`, `bridge`, `inst`, `solo`, `break`, `outro` (the raw `start`/`end` silence markers are dropped). Pipeline per request: Demucs source separation (hdemucs_mmi — allin1's default htdemucs is monkey-patched out for ~2× CPU speedup at similar memory footprint) → spectrogram extraction → neighborhood-attention transformer → boundary detection + label classification.
 
 ```json
 {
@@ -101,9 +101,38 @@ Override the model via `ALLIN1_MODEL`:
 - `ALLIN1_MODEL=harmonix-all` — 8-fold ensemble, ~1–3 F1 points more accurate on Harmonix boundary/label benchmarks, but ~8× the inference cost (a 4-min track jumps to ~3–5 min total on native amd64 CPU).
 - `ALLIN1_MODEL=harmonix-foldN` (N in 0..7) — pick any individual fold.
 
-Model weights (~410 MB total: ~80 MB hdemucs_mmi + ~250 MB htdemucs fallback + ~80 MB for all 8 allin1 fold checkpoints) are pre-baked into the image, so first request pays no download cost regardless of which `ALLIN1_MODEL` you select. The Demucs separator is hard-coded to hdemucs_mmi via a runtime monkey-patch — htdemucs weights stay in the image for future opt-in but aren't selectable yet.
+Model weights (~1.9 GB total: ~80 MB hdemucs_mmi + ~250 MB htdemucs fallback + ~80 MB for all 8 allin1 fold checkpoints + ~1.5 GB faster-whisper medium) are pre-baked into the image, so first request pays no download cost regardless of which `ALLIN1_MODEL`/`WHISPER_MODEL` you select. The Demucs separator is hard-coded to hdemucs_mmi via a runtime monkey-patch — htdemucs weights stay in the image for future opt-in but aren't selectable yet.
 
 `bpm` here is an integer reported by allin1's beat tracker, distinct from the librosa-based float returned by `/extract` and `/bpm`.
+
+#### Lyrics opt-in (`?lyrics=true`)
+
+Append `?lyrics=true` to additionally run [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) on the *vocals* stem that Demucs already separated. Each transcribed phrase is tagged with the structural label whose interval contains its midpoint:
+
+```json
+{
+  "duration": 269.28,
+  "bpm": 107,
+  "beats": [...],
+  "downbeats": [...],
+  "segments": [
+    { "start":  19.49, "end":  37.87, "label": "verse" },
+    { "start": 108.99, "end": 126.77, "label": "chorus" }
+  ],
+  "lyrics": [
+    { "start": 20.10, "end": 24.50, "text": "Em sẽ về thăm anh nhé...",  "label": "verse" },
+    { "start": 109.20, "end": 113.80, "text": "Anh hứa sẽ luôn ở bên...", "label": "chorus" }
+  ]
+}
+```
+
+When `lyrics` is omitted or `false`, the field is `null` and Whisper is not invoked.
+
+Whisper config via env:
+- `WHISPER_MODEL` (default `medium`) — one of `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. Smaller = faster, lower accuracy. `medium` is the recommended Vietnamese sweet spot.
+- `WHISPER_LANGUAGE` (default `vi`) — ISO 639-1 code, or unset to let Whisper auto-detect.
+
+Latency cost of `?lyrics=true`: ~30-45 s on native amd64 CPU (faster-whisper `medium` int8 on a 4-min vocals stem), ~5-10 s on RTX 3050 Ti fp16. The endpoint roughly doubles in wall-clock when lyrics are requested.
 
 Supported direct-URL audio formats: `mp3`, `wav`, `ogg`, `flac`, `m4a`, `webm`. Hard limit 100 MB per file (applies to both direct URLs and YouTube downloads).
 

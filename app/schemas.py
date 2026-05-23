@@ -35,9 +35,17 @@ class Section(BaseModel):
     label: str
 
 
+class LyricLine(BaseModel):
+    start: float
+    end: float
+    text: str
+    label: str  # structural label from segments[]; "unknown" if no segment covers
+
+
 class SectionsResponse(BaseModel):
     duration: float
     bpm: int
     beats: list[float]
     downbeats: list[float]
     segments: list[Section]
+    lyrics: list[LyricLine] | None = None

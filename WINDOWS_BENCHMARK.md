@@ -207,6 +207,43 @@ docker rm -f chord-test
 
 ---
 
+## Phase 3 — Optional: `?lyrics=true` (ASR + alignment)
+
+Reuse whatever image is currently running (CPU or GPU container). The endpoint adds a faster-whisper transcription step on Demucs's vocals stem.
+
+```powershell
+$body = '{"url": "https://www.youtube.com/watch?v=JgdXcwuggpU"}'
+$start = Get-Date
+$resp = Invoke-RestMethod -Uri "http://localhost:8000/sections?lyrics=true" `
+    -Method POST -ContentType "application/json" -Body $body -TimeoutSec 900
+$elapsed = (Get-Date) - $start
+"`nElapsed (with lyrics): $([math]::Round($elapsed.TotalSeconds, 1))s`n"
+"segments: $($resp.segments.Count)"
+"lyrics: $($resp.lyrics.Count) phrases"
+$resp.lyrics | Select-Object -First 10 | ForEach-Object {
+    "  {0,7:N2} - {1,7:N2}  [{2}]  {3}" -f $_.start, $_.end, $_.label, $_.text
+}
+$resp | ConvertTo-Json -Depth 10 | Out-File $env:TEMP\sections-lyrics.json
+```
+
+Expected: `lyrics` is an array of `{start, end, text, label}` where `label` is the structural section ("intro" / "verse" / "chorus" / "bridge" / "inst" / "solo" / "break" / "outro" / "unknown"). On the test track (Vietnamese), the transcription should match the song's actual vocal content; quality depends on `WHISPER_MODEL` (default `medium`).
+
+Latency budget vs Phase 1/2 (same hardware, just add this delta):
+- CPU phase + lyrics: ~+30-45 s
+- GPU phase + lyrics: ~+5-10 s
+
+If you want to test a smaller/larger Whisper model, pass the env when starting the container:
+
+```powershell
+docker run -d --name chord-test --platform linux/amd64 `
+    -e WHISPER_MODEL=large-v3-turbo `
+    -p 8000:8000 chord-extractor-api:cpu
+```
+
+(Bigger models will trigger a HuggingFace download on first request since only `medium` is prebaked. Adds ~30-90 s cold-start.)
+
+---
+
 ## Reporting back
 
 Capture both phase results in this format and reply with it:

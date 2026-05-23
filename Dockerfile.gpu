@@ -35,7 +35,8 @@ RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir \
         torch==2.5.0 torchaudio==2.5.0 \
  && /app/.pixi/envs/default/bin/pip install --no-cache-dir \
         https://github.com/SHI-Labs/NATTEN/releases/download/v0.17.4/natten-0.17.4%2Btorch250cu121-cp311-cp311-linux_x86_64.whl \
- && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq \
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir faster-whisper
 
 # Prefetch model weights. We still pass device='cpu' here because the build
 # host has no GPU access — only the *files* matter for caching. Runtime
@@ -51,7 +52,9 @@ from allin1.models import load_pretrained_model; \
 load_pretrained_model('harmonix-all', device='cpu'); \
 from demucs.pretrained import get_model; \
 get_model('hdemucs_mmi'); \
-get_model('htdemucs')"
+get_model('htdemucs'); \
+from faster_whisper import WhisperModel; \
+WhisperModel('medium', device='cpu', compute_type='int8')"
 
 # Runtime base: nvidia/cuda 12.1 on Ubuntu 22.04 instead of debian:bookworm.
 # Same userland (glibc 2.35 vs 2.36 — both new enough for our pixi-managed

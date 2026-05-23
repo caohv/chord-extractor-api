@@ -63,11 +63,13 @@ async def meter(req: ExtractRequest) -> MeterResponse:
 
 
 @app.post("/sections", response_model=SectionsResponse)
-async def sections(req: ExtractRequest) -> SectionsResponse:
+async def sections(
+    req: ExtractRequest, lyrics: bool = False
+) -> SectionsResponse:
     url = str(req.url)
-    logger.info("sections requested url=%s", url)
+    logger.info("sections requested url=%s lyrics=%s", url, lyrics)
     async with download_to_temp(url) as path:
-        result = await run_in_threadpool(extract_sections, path)
+        result = await run_in_threadpool(extract_sections, path, lyrics)
     return SectionsResponse(**result)
 
 

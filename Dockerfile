@@ -25,7 +25,8 @@ RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir \
         torch==2.5.0 torchaudio==2.5.0 \
  && /app/.pixi/envs/default/bin/pip install --no-cache-dir \
         https://github.com/SHI-Labs/NATTEN/releases/download/v0.17.4/natten-0.17.4%2Btorch250cpu-cp311-cp311-linux_x86_64.whl \
- && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq \
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir faster-whisper
 
 # Pre-fetch model weights so the first /sections request doesn't pay the
 # download cost. allin1's harmonix-all caches all 8 fold checkpoints
@@ -50,7 +51,9 @@ from allin1.models import load_pretrained_model; \
 load_pretrained_model('harmonix-all', device='cpu'); \
 from demucs.pretrained import get_model; \
 get_model('hdemucs_mmi'); \
-get_model('htdemucs')"
+get_model('htdemucs'); \
+from faster_whisper import WhisperModel; \
+WhisperModel('medium', device='cpu', compute_type='int8')"
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

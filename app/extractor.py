@@ -245,7 +245,62 @@ def _patch_allin1_demix() -> None:
     analyze_module.demix = _demix
 
 
-def extract_sections(audio_path: str) -> dict:
+def _label_for_midpoint(midpoint: float, segments: list[dict]) -> str:
+    # Stable nearest-section lookup. A lyric phrase that straddles two
+    # structural sections gets labeled by whichever the midpoint lands in;
+    # if no segment covers it (e.g. dropped start/end silence at the edges),
+    # fall back to "unknown" rather than guessing.
+    for s in segments:
+        if s["start"] <= midpoint < s["end"]:
+            return s["label"]
+    return "unknown"
+
+
+def _transcribe_aligned(
+    vocals_path: Path, segments: list[dict], device: str
+) -> list[dict]:
+    # faster-whisper is a CTranslate2-backed reimplementation of OpenAI
+    # Whisper. On CPU it's ~4× faster than openai-whisper at the same
+    # accuracy; on GPU it uses fp16 by default. We feed it the *vocals*
+    # stem that Demucs already separated for /sections, so transcription
+    # quality is much higher than passing the original mix (no
+    # instrumental bleed-through).
+    from faster_whisper import WhisperModel
+
+    # int8 on CPU gives a further ~2× speedup at ~1% WER cost; fp16 on
+    # GPU is the standard accuracy/speed sweet spot.
+    compute_type = "float16" if device == "cuda" else "int8"
+
+    model = WhisperModel(
+        os.environ.get("WHISPER_MODEL") or "medium",
+        device=device,
+        compute_type=compute_type,
+    )
+
+    segments_iter, _info = model.transcribe(
+        str(vocals_path),
+        language=os.environ.get("WHISPER_LANGUAGE") or "vi",
+        beam_size=1,
+        # VAD pre-filters silence so Whisper doesn't hallucinate filler
+        # text during instrumental gaps (a real risk on music input).
+        vad_filter=True,
+    )
+
+    lyrics: list[dict] = []
+    for ws in segments_iter:
+        midpoint = (ws.start + ws.end) / 2.0
+        lyrics.append(
+            {
+                "start": float(ws.start),
+                "end": float(ws.end),
+                "text": ws.text.strip(),
+                "label": _label_for_midpoint(midpoint, segments),
+            }
+        )
+    return lyrics
+
+
+def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
     # allin1 imports madmom via its spectrogram module, so we hit the same
     # Python 3.10+/numpy compat issues as extract_meter. Patch before the
     # import chain runs. NATTEN's CPU import also needs a CUDA-probe stub.
@@ -271,8 +326,7 @@ def extract_sections(audio_path: str) -> dict:
 
     # allin1 defaults demix_dir/spec_dir to ./demix and ./spec relative to
     # cwd. In an HTTP server that turns concurrent requests into a race over
-    # shared scratch dirs; isolate each call in its own tempdir and let
-    # keep_byproducts=False clean up.
+    # shared scratch dirs; isolate each call in its own tempdir.
     model_name = os.environ.get("ALLIN1_MODEL") or _DEFAULT_ALLIN1_MODEL
 
     with tempfile.TemporaryDirectory(prefix="allin1-") as scratch:
@@ -283,7 +337,10 @@ def extract_sections(audio_path: str) -> dict:
             demix_dir=scratch_path / "demix",
             spec_dir=scratch_path / "spec",
             device=device,
-            keep_byproducts=False,
+            # When transcribing, keep the demixed stems on disk so we can
+            # feed vocals.wav to Whisper without re-running Demucs. The
+            # tempdir context manager still wipes everything on exit.
+            keep_byproducts=include_lyrics,
             # multiprocess spawns helper procs for spectrogram extraction.
             # Inside uvicorn's threadpool that adds fork overhead with no
             # win on single-file requests, and risks issues under gunicorn
@@ -291,11 +348,30 @@ def extract_sections(audio_path: str) -> dict:
             multiprocess=False,
         )
 
-    segments = [
-        {"start": float(s.start), "end": float(s.end), "label": s.label}
-        for s in result.segments
-        if s.label not in _DROPPED_SECTION_LABELS
-    ]
+        segments = [
+            {"start": float(s.start), "end": float(s.end), "label": s.label}
+            for s in result.segments
+            if s.label not in _DROPPED_SECTION_LABELS
+        ]
+
+        lyrics: list[dict] | None = None
+        if include_lyrics:
+            # Demucs writes stems to <demix_dir>/<model_name>/<stem>/{bass,drums,other,vocals}.wav
+            # where <stem> is the input filename without extension.
+            vocals_path = (
+                scratch_path
+                / "demix"
+                / "hdemucs_mmi"
+                / Path(audio_path).stem
+                / "vocals.wav"
+            )
+            if vocals_path.is_file():
+                lyrics = _transcribe_aligned(vocals_path, segments, device)
+            else:
+                # Fall back to the original mix if vocals stem went missing
+                # for some reason — Whisper will still produce something,
+                # just lower quality.
+                lyrics = _transcribe_aligned(Path(audio_path), segments, device)
 
     return {
         "duration": duration,
@@ -303,4 +379,5 @@ def extract_sections(audio_path: str) -> dict:
         "beats": [float(b) for b in result.beats],
         "downbeats": [float(b) for b in result.downbeats],
         "segments": segments,
+        "lyrics": lyrics,
     }
