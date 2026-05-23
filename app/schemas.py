@@ -3,6 +3,12 @@ from pydantic import BaseModel, HttpUrl
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
+    # Optional canonical lyrics (one entry per line/phrase as it appears in
+    # the song, with repetitions expanded). When present, /sections uses
+    # Whisper purely as a timing source and force-aligns these lines against
+    # the audio via Needleman-Wunsch on tokens. When absent, no transcription
+    # runs.
+    lyrics: list[str] | None = None
 
 
 class Chord(BaseModel):
@@ -36,10 +42,14 @@ class Section(BaseModel):
 
 
 class LyricLine(BaseModel):
-    start: float
-    end: float
+    # `start`/`end` are None when the line couldn't be aligned to any audio
+    # (e.g. a backing-vocal line Whisper missed). In that case `label` is
+    # "unaligned"; otherwise it's the structural section ("verse", "chorus",
+    # ...) whose interval contains the line's midpoint.
+    start: float | None
+    end: float | None
     text: str
-    label: str  # structural label from segments[]; "unknown" if no segment covers
+    label: str
 
 
 class SectionsResponse(BaseModel):

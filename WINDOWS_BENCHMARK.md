@@ -207,26 +207,55 @@ docker rm -f chord-test
 
 ---
 
-## Phase 3 — Optional: `?lyrics=true` (ASR + alignment)
+## Phase 3 — Optional: forced alignment of canonical lyrics
 
-Reuse whatever image is currently running (CPU or GPU container). The endpoint adds a faster-whisper transcription step on Demucs's vocals stem.
+Reuse whatever image is currently running (CPU or GPU container). Pass `lyrics` in the body — array of canonical lines (one per array entry, repetitions expanded). The server runs faster-whisper at word level on Demucs's vocals stem and DP-aligns your canonical tokens to Whisper's timing; the response text is always your input line, never Whisper's transcript.
+
+Reference test fixture: "Miền An Nhiên" lyrics (verse 1, chorus, verse 2, chorus repeat). Copy this PowerShell block as-is to benchmark:
 
 ```powershell
-$body = '{"url": "https://www.youtube.com/watch?v=JgdXcwuggpU"}'
+$payload = @{
+    url = "https://www.youtube.com/watch?v=JgdXcwuggpU"
+    lyrics = @(
+        # Verse 1
+        "Mình ra thành phố tìm về một nơi thật an nhiên",
+        "Tạm quên ngày tháng, bỏ lại đằng sau những muộn phiền",
+        "Ngày mai chẳng biết con đường này sẽ về nơi đâu",
+        "Chỉ mong thật sẽ luôn bên nhau như ngày đầu",
+        # Verse 2
+        "Xe lăn trên những chặng đường",
+        "Về yêu thương bình yên sớm tối",
+        "Ngày ấy ta cùng nhau mỗi sớm mai tinh dậy",
+        "Cho nắng sớm mơ màng một ngày bừng sáng lên",
+        # Pre-chorus
+        "Vì ta yêu hết những cánh đồng",
+        "Vì ta mong song song dài mãi",
+        "Ngọn núi kia chờ ta từng lối mòn vượt qua",
+        "Chỉ ta biết hôm nay mình vẫn còn có nhau",
+        # Chorus (first time)
+        "Mình ra thành phố tìm về một nơi thật an nhiên",
+        "Tạm quên ngày tháng, bỏ lại đằng sau những muộn phiền",
+        "Ngày mai chẳng biết con đường này sẽ về nơi đâu",
+        "Chỉ mong thật sẽ luôn bên nhau như ngày đầu"
+    )
+} | ConvertTo-Json -Depth 5
+
 $start = Get-Date
-$resp = Invoke-RestMethod -Uri "http://localhost:8000/sections?lyrics=true" `
-    -Method POST -ContentType "application/json" -Body $body -TimeoutSec 900
+$resp = Invoke-RestMethod -Uri "http://localhost:8000/sections" `
+    -Method POST -ContentType "application/json" -Body $payload -TimeoutSec 900
 $elapsed = (Get-Date) - $start
 "`nElapsed (with lyrics): $([math]::Round($elapsed.TotalSeconds, 1))s`n"
 "segments: $($resp.segments.Count)"
-"lyrics: $($resp.lyrics.Count) phrases"
-$resp.lyrics | Select-Object -First 10 | ForEach-Object {
-    "  {0,7:N2} - {1,7:N2}  [{2}]  {3}" -f $_.start, $_.end, $_.label, $_.text
+"lyrics: $($resp.lyrics.Count) (aligned $($resp.lyrics | Where-Object { $_.start -ne $null } | Measure-Object).Count)"
+$resp.lyrics | ForEach-Object {
+    $s = if ($_.start -ne $null) { "{0,7:N2}" -f $_.start } else { "  none " }
+    $e = if ($_.end -ne $null) { "{0,7:N2}" -f $_.end } else { "  none " }
+    "  $s - $e  [$($_.label.PadRight(9))]  $($_.text)"
 }
 $resp | ConvertTo-Json -Depth 10 | Out-File $env:TEMP\sections-lyrics.json
 ```
 
-Expected: `lyrics` is an array of `{start, end, text, label}` where `label` is the structural section ("intro" / "verse" / "chorus" / "bridge" / "inst" / "solo" / "break" / "outro" / "unknown"). On the test track (Vietnamese), the transcription should match the song's actual vocal content; quality depends on `WHISPER_MODEL` (default `medium`).
+Expected: `lyrics` array length equals input lyrics count. Each entry has either `start`/`end` timestamps + a structural label (`verse`/`chorus`/`bridge`/...) or `null`/`null`/`unaligned` if Whisper couldn't find that line's words. Replace the `lyrics` array with your own song's canonical lines for other tracks.
 
 Latency budget vs Phase 1/2 (same hardware, just add this delta):
 - CPU phase + lyrics: ~+30-45 s

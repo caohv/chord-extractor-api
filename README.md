@@ -74,7 +74,7 @@ Mapping: `3 → 3/4` (simple triple), `4 → 4/4` (simple quadruple), `6 → 6/8
 This endpoint runs an RNN forward pass over the full audio and is the slowest of the three (~5–10 s on native amd64, longer under emulation).
 
 ### `POST /sections`
-Same body as `/extract`. Optional query param `?lyrics=true` to additionally transcribe and align lyrics (see "Lyrics opt-in" below). Runs music structure analysis with [`allin1`](https://github.com/mir-aidj/all-in-one) (state-of-the-art ISMIR 2023 model). Returns functional segments labeled `intro`, `verse`, `chorus`, `bridge`, `inst`, `solo`, `break`, `outro` (the raw `start`/`end` silence markers are dropped). Pipeline per request: Demucs source separation (hdemucs_mmi — allin1's default htdemucs is monkey-patched out for ~2× CPU speedup at similar memory footprint) → spectrogram extraction → neighborhood-attention transformer → boundary detection + label classification.
+Body: same as `/extract` (`{"url": ...}`), plus an optional `lyrics` array of canonical lines for forced alignment (see "Lyric alignment" below). Runs music structure analysis with [`allin1`](https://github.com/mir-aidj/all-in-one) (state-of-the-art ISMIR 2023 model). Returns functional segments labeled `intro`, `verse`, `chorus`, `bridge`, `inst`, `solo`, `break`, `outro` (the raw `start`/`end` silence markers are dropped). Pipeline per request: Demucs source separation (hdemucs_mmi — allin1's default htdemucs is monkey-patched out for ~2× CPU speedup at similar memory footprint) → spectrogram extraction → neighborhood-attention transformer → boundary detection + label classification.
 
 ```json
 {
@@ -105,9 +105,26 @@ Model weights (~1.9 GB total: ~80 MB hdemucs_mmi + ~250 MB htdemucs fallback + ~
 
 `bpm` here is an integer reported by allin1's beat tracker, distinct from the librosa-based float returned by `/extract` and `/bpm`.
 
-#### Lyrics opt-in (`?lyrics=true`)
+#### Lyric alignment (`lyrics` body field)
 
-Append `?lyrics=true` to additionally run [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) on the *vocals* stem that Demucs already separated. Each transcribed phrase is tagged with the structural label whose interval contains its midpoint:
+Pass canonical lyrics in the request body to have each line aligned to a timestamp and a structural label. Whisper transcription is used **only as a timing source** — the response text is always your canonical line, not Whisper's transcript (which can mis-recognize Vietnamese words). The matching runs Whisper at word-level on the Demucs vocals stem, then Needleman-Wunsch aligns your canonical tokens to Whisper's word stream.
+
+Request:
+
+```json
+{
+  "url": "https://...",
+  "lyrics": [
+    "Mình ra thành phố tìm về một nơi thật an nhiên",
+    "Tạm quên ngày tháng, bỏ lại đằng sau những muộn phiền",
+    "Chỉ mong thật sẽ luôn bên nhau như ngày đầu"
+  ]
+}
+```
+
+Pass each line as a separate array entry, **with repetitions expanded** — if the chorus appears 3 times in the song, include it 3 times in the array, in order. The server does not auto-repeat sections.
+
+Response:
 
 ```json
 {
@@ -120,19 +137,20 @@ Append `?lyrics=true` to additionally run [`faster-whisper`](https://github.com/
     { "start": 108.99, "end": 126.77, "label": "chorus" }
   ],
   "lyrics": [
-    { "start": 20.10, "end": 24.50, "text": "Em sẽ về thăm anh nhé...",  "label": "verse" },
-    { "start": 109.20, "end": 113.80, "text": "Anh hứa sẽ luôn ở bên...", "label": "chorus" }
+    { "start":  20.10, "end":  24.50, "text": "Mình ra thành phố tìm về một nơi thật an nhiên", "label": "verse" },
+    { "start":  24.50, "end":  29.30, "text": "Tạm quên ngày tháng, bỏ lại đằng sau những muộn phiền", "label": "verse" },
+    { "start": null, "end": null, "text": "Chỉ mong thật sẽ luôn bên nhau như ngày đầu", "label": "unaligned" }
   ]
 }
 ```
 
-When `lyrics` is omitted or `false`, the field is `null` and Whisper is not invoked.
+When `lyrics` is omitted from the body, the `lyrics` field in the response is `null` and Whisper does not run. A line that couldn't be matched to any Whisper word (e.g. backing-vocals Whisper missed) gets `start=end=null` and `label="unaligned"`.
 
 Whisper config via env:
-- `WHISPER_MODEL` (default `medium`) — one of `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. Smaller = faster, lower accuracy. `medium` is the recommended Vietnamese sweet spot.
+- `WHISPER_MODEL` (default `medium`) — one of `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`. Smaller = faster, less reliable word boundaries.
 - `WHISPER_LANGUAGE` (default `vi`) — ISO 639-1 code, or unset to let Whisper auto-detect.
 
-Latency cost of `?lyrics=true`: ~30-45 s on native amd64 CPU (faster-whisper `medium` int8 on a 4-min vocals stem), ~5-10 s on RTX 3050 Ti fp16. The endpoint roughly doubles in wall-clock when lyrics are requested.
+Latency cost: ~30-45 s on native amd64 CPU (faster-whisper `medium` int8 with word timestamps on a 4-min vocals stem), ~5-10 s on RTX 3050 Ti fp16. The endpoint roughly doubles in wall-clock when lyrics are requested.
 
 Supported direct-URL audio formats: `mp3`, `wav`, `ogg`, `flac`, `m4a`, `webm`. Hard limit 100 MB per file (applies to both direct URLs and YouTube downloads).
 

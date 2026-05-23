@@ -245,62 +245,230 @@ def _patch_allin1_demix() -> None:
     analyze_module.demix = _demix
 
 
-def _label_for_midpoint(midpoint: float, segments: list[dict]) -> str:
-    # Stable nearest-section lookup. A lyric phrase that straddles two
-    # structural sections gets labeled by whichever the midpoint lands in;
-    # if no segment covers it (e.g. dropped start/end silence at the edges),
-    # fall back to "unknown" rather than guessing.
+def _label_for_interval(start: float, end: float, segments: list[dict]) -> str:
+    # Assign the structural label whose interval *overlaps* the lyric line
+    # the most. Midpoint-only lookup misses lines that slightly spill past
+    # a section boundary (Whisper word ends ~200 ms after audible vocal
+    # cutoff is common, and section boundaries from the structural model
+    # can be ±1 s of the true musical change). Pick max-overlap, fall back
+    # to "unknown" only if there's zero overlap with any section (e.g.
+    # the line landed entirely in dropped start/end silence regions).
+    best_label = "unknown"
+    best_overlap = 0.0
     for s in segments:
-        if s["start"] <= midpoint < s["end"]:
-            return s["label"]
-    return "unknown"
+        overlap = max(0.0, min(end, s["end"]) - max(start, s["start"]))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_label = s["label"]
+    return best_label
 
 
-def _transcribe_aligned(
-    vocals_path: Path, segments: list[dict], device: str
+def _normalize_vi(word: str) -> str:
+    # Lowercase + strip punctuation. Vietnamese diacritics are kept; both
+    # Whisper output and canonical lyrics use them, and stripping would
+    # collapse semantically-distinct words ("ma"/"má"/"mà"). The token
+    # comparison is exact-equality on this normalized form, with substring
+    # match as a partial-credit fallback in `_nw_align`.
+    import re
+
+    return re.sub(r"[^\w\s]", "", word.lower()).strip()
+
+
+def _nw_align(
+    canonical: list[dict], whisper: list[dict]
+) -> list[tuple[int | None, int | None]]:
+    # Standard Needleman-Wunsch global alignment. Match score +2, mismatch
+    # -1, gap -1. We allow a "soft match" (+1) when one normalized word
+    # contains the other as a substring — Whisper sometimes joins or
+    # splits words, and this catches the common cases without going to a
+    # full edit-distance scorer.
+    n, m = len(canonical), len(whisper)
+    MATCH, SOFT, MISMATCH, GAP = 2, 1, -1, -1
+
+    def sim(a: dict, b: dict) -> int:
+        if a["norm"] and a["norm"] == b["norm"]:
+            return MATCH
+        if a["norm"] and b["norm"] and (
+            a["norm"] in b["norm"] or b["norm"] in a["norm"]
+        ):
+            return SOFT
+        return MISMATCH
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i * GAP
+    for j in range(m + 1):
+        dp[0][j] = j * GAP
+    for i in range(1, n + 1):
+        ci = canonical[i - 1]
+        row = dp[i]
+        prev_row = dp[i - 1]
+        for j in range(1, m + 1):
+            row[j] = max(
+                prev_row[j - 1] + sim(ci, whisper[j - 1]),
+                prev_row[j] + GAP,
+                row[j - 1] + GAP,
+            )
+
+    aligned: list[tuple[int | None, int | None]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if (
+            i > 0
+            and j > 0
+            and dp[i][j]
+            == dp[i - 1][j - 1] + sim(canonical[i - 1], whisper[j - 1])
+        ):
+            aligned.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + GAP:
+            aligned.append((i - 1, None))
+            i -= 1
+        else:
+            aligned.append((None, j - 1))
+            j -= 1
+    aligned.reverse()
+    return aligned
+
+
+def _aggregate_line_timings(
+    alignment: list[tuple[int | None, int | None]],
+    canonical_words: list[dict],
+    whisper_words: list[dict],
+) -> dict[int, dict]:
+    # Plain min/max over alignment matches fails when a canonical line
+    # picks up a single outlier match elsewhere in the song — e.g. a word
+    # that fuzzy-matches a repeated chorus phrase stretches the line's
+    # span over a 30+ s gap. Instead, group the matched whisper indices
+    # per canonical line, then pick the longest *contiguous run*: a
+    # consecutive sequence of whisper indices whose neighbours are within
+    # MAX_IDX_GAP positions AND MAX_TIME_GAP seconds. Tie-break by
+    # earliest start so we prefer the in-order match when canonical
+    # repeats. Lines whose words got scattered across the song still
+    # produce a tight span (best 2-3 word run) instead of an inflated one.
+    MAX_IDX_GAP = 5
+    MAX_TIME_GAP = 5.0
+
+    per_line: dict[int, list[int]] = {}
+    for c, w in alignment:
+        if c is None or w is None:
+            continue
+        per_line.setdefault(canonical_words[c]["line"], []).append(w)
+
+    timings: dict[int, dict] = {}
+    for line, w_indices in per_line.items():
+        w_indices.sort()
+        runs: list[list[int]] = [[w_indices[0]]]
+        for idx in w_indices[1:]:
+            gap_idx = idx - runs[-1][-1]
+            gap_t = (
+                whisper_words[idx]["start"]
+                - whisper_words[runs[-1][-1]]["end"]
+            )
+            if gap_idx <= MAX_IDX_GAP and gap_t <= MAX_TIME_GAP:
+                runs[-1].append(idx)
+            else:
+                runs.append([idx])
+        runs.sort(
+            key=lambda r: (-len(r), whisper_words[r[0]]["start"])
+        )
+        best = runs[0]
+        timings[line] = {
+            "start": whisper_words[best[0]]["start"],
+            "end": whisper_words[best[-1]]["end"],
+        }
+    return timings
+
+
+def _align_canonical_lyrics(
+    vocals_path: Path,
+    canonical_lines: list[str],
+    segments: list[dict],
+    device: str,
 ) -> list[dict]:
-    # faster-whisper is a CTranslate2-backed reimplementation of OpenAI
-    # Whisper. On CPU it's ~4× faster than openai-whisper at the same
-    # accuracy; on GPU it uses fp16 by default. We feed it the *vocals*
-    # stem that Demucs already separated for /sections, so transcription
-    # quality is much higher than passing the original mix (no
-    # instrumental bleed-through).
+    # Force-align user-provided canonical lyrics against the audio. We use
+    # Whisper purely as a timing oracle (word-level timestamps); the text
+    # in the response is always the user's canonical line, never Whisper's
+    # transcription. Whisper's word boundaries are derived from
+    # cross-attention and are roughly ±200 ms on Vietnamese — adequate for
+    # section-level labeling and UI display, but not karaoke-grade per-word
+    # sync.
     from faster_whisper import WhisperModel
 
-    # int8 on CPU gives a further ~2× speedup at ~1% WER cost; fp16 on
-    # GPU is the standard accuracy/speed sweet spot.
     compute_type = "float16" if device == "cuda" else "int8"
-
     model = WhisperModel(
         os.environ.get("WHISPER_MODEL") or "medium",
         device=device,
         compute_type=compute_type,
     )
 
-    segments_iter, _info = model.transcribe(
+    whisper_segments, _info = model.transcribe(
         str(vocals_path),
         language=os.environ.get("WHISPER_LANGUAGE") or "vi",
         beam_size=1,
-        # VAD pre-filters silence so Whisper doesn't hallucinate filler
-        # text during instrumental gaps (a real risk on music input).
         vad_filter=True,
+        word_timestamps=True,
     )
 
-    lyrics: list[dict] = []
-    for ws in segments_iter:
-        midpoint = (ws.start + ws.end) / 2.0
-        lyrics.append(
-            {
-                "start": float(ws.start),
-                "end": float(ws.end),
-                "text": ws.text.strip(),
-                "label": _label_for_midpoint(midpoint, segments),
-            }
+    whisper_words: list[dict] = []
+    for seg in whisper_segments:
+        for w in seg.words or []:
+            text = w.word.strip()
+            if not text:
+                continue
+            whisper_words.append(
+                {
+                    "norm": _normalize_vi(text),
+                    "start": float(w.start),
+                    "end": float(w.end),
+                }
+            )
+
+    canonical_words: list[dict] = []
+    for line_idx, line in enumerate(canonical_lines):
+        for raw_word in line.split():
+            norm = _normalize_vi(raw_word)
+            if not norm:
+                continue
+            canonical_words.append({"line": line_idx, "norm": norm})
+
+    line_timings: dict[int, dict] = {}
+    if canonical_words and whisper_words:
+        alignment = _nw_align(canonical_words, whisper_words)
+        line_timings = _aggregate_line_timings(
+            alignment, canonical_words, whisper_words
         )
-    return lyrics
+
+    aligned: list[dict] = []
+    for i, text in enumerate(canonical_lines):
+        if i in line_timings:
+            t = line_timings[i]
+            aligned.append(
+                {
+                    "start": t["start"],
+                    "end": t["end"],
+                    "text": text,
+                    "label": _label_for_interval(
+                        t["start"], t["end"], segments
+                    ),
+                }
+            )
+        else:
+            aligned.append(
+                {
+                    "start": None,
+                    "end": None,
+                    "text": text,
+                    "label": "unaligned",
+                }
+            )
+    return aligned
 
 
-def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
+def extract_sections(
+    audio_path: str, canonical_lyrics: list[str] | None = None
+) -> dict:
     # allin1 imports madmom via its spectrogram module, so we hit the same
     # Python 3.10+/numpy compat issues as extract_meter. Patch before the
     # import chain runs. NATTEN's CPU import also needs a CUDA-probe stub.
@@ -329,6 +497,8 @@ def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
     # shared scratch dirs; isolate each call in its own tempdir.
     model_name = os.environ.get("ALLIN1_MODEL") or _DEFAULT_ALLIN1_MODEL
 
+    want_lyrics = bool(canonical_lyrics)
+
     with tempfile.TemporaryDirectory(prefix="allin1-") as scratch:
         scratch_path = Path(scratch)
         result = allin1.analyze(
@@ -337,10 +507,10 @@ def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
             demix_dir=scratch_path / "demix",
             spec_dir=scratch_path / "spec",
             device=device,
-            # When transcribing, keep the demixed stems on disk so we can
-            # feed vocals.wav to Whisper without re-running Demucs. The
-            # tempdir context manager still wipes everything on exit.
-            keep_byproducts=include_lyrics,
+            # When aligning lyrics, keep the demixed stems on disk so we
+            # can feed vocals.wav to Whisper without re-running Demucs.
+            # The tempdir context manager still wipes everything on exit.
+            keep_byproducts=want_lyrics,
             # multiprocess spawns helper procs for spectrogram extraction.
             # Inside uvicorn's threadpool that adds fork overhead with no
             # win on single-file requests, and risks issues under gunicorn
@@ -355,8 +525,9 @@ def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
         ]
 
         lyrics: list[dict] | None = None
-        if include_lyrics:
-            # Demucs writes stems to <demix_dir>/<model_name>/<stem>/{bass,drums,other,vocals}.wav
+        if want_lyrics:
+            # Demucs writes stems to
+            # <demix_dir>/<model_name>/<stem>/{bass,drums,other,vocals}.wav
             # where <stem> is the input filename without extension.
             vocals_path = (
                 scratch_path
@@ -365,13 +536,15 @@ def extract_sections(audio_path: str, include_lyrics: bool = False) -> dict:
                 / Path(audio_path).stem
                 / "vocals.wav"
             )
-            if vocals_path.is_file():
-                lyrics = _transcribe_aligned(vocals_path, segments, device)
-            else:
-                # Fall back to the original mix if vocals stem went missing
-                # for some reason — Whisper will still produce something,
-                # just lower quality.
-                lyrics = _transcribe_aligned(Path(audio_path), segments, device)
+            audio_for_whisper = (
+                vocals_path if vocals_path.is_file() else Path(audio_path)
+            )
+            lyrics = _align_canonical_lyrics(
+                audio_for_whisper,
+                canonical_lyrics or [],
+                segments,
+                device,
+            )
 
     return {
         "duration": duration,
