@@ -1,0 +1,79 @@
+# GPU variant of Dockerfile. Identical structure but installs CUDA-enabled
+# PyTorch + NATTEN wheels (cu121) on top of an `nvidia/cuda` runtime base.
+# Use this image with `docker run --gpus all` on a host that has the NVIDIA
+# Container Toolkit installed; the runtime auto-detects CUDA via
+# `torch.cuda.is_available()` in `extract_sections`, so no code changes are
+# needed between cpu/gpu deploys.
+#
+# Build:
+#   docker buildx build --platform linux/amd64 -f Dockerfile.gpu -t chord-extractor-api:gpu .
+#
+# Run:
+#   docker run -d --gpus all --platform linux/amd64 -p 8000:8000 \
+#       --name chord-test chord-extractor-api:gpu
+#
+# Verify CUDA is live inside the container:
+#   docker exec chord-test /app/.pixi/envs/default/bin/python -c \
+#       "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+FROM ghcr.io/prefix-dev/pixi:latest AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY pixi.toml pixi.lock* ./
+RUN pixi install --locked || pixi install
+RUN pixi shell-hook -e default > /shell-hook && echo 'exec "$@"' >> /shell-hook
+
+# Layer allin1 on top of the pixi env via pip. This block mirrors the CPU
+# Dockerfile but swaps the PyTorch index and the NATTEN wheel for the
+# CUDA 12.1 builds. The NATTEN wheel name encodes both the torch version
+# AND the CUDA toolkit version (`+torch250cu121`), so all three pins must
+# move together if you bump anything.
+RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu121 \
+        --extra-index-url https://pypi.org/simple \
+        torch==2.5.0 torchaudio==2.5.0 \
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir \
+        https://github.com/SHI-Labs/NATTEN/releases/download/v0.17.4/natten-0.17.4%2Btorch250cu121-cp311-cp311-linux_x86_64.whl \
+ && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq
+
+# Prefetch model weights. We still pass device='cpu' here because the build
+# host has no GPU access — only the *files* matter for caching. Runtime
+# inference will load these checkpoints onto CUDA via .to(device).
+COPY app/ ./app/
+ENV HF_HOME=/opt/cache/huggingface
+ENV TORCH_HOME=/opt/cache/torch
+RUN /app/.pixi/envs/default/bin/python -c "\
+from app.extractor import _patch_madmom_compat, _patch_natten_cpu; \
+_patch_madmom_compat(); \
+_patch_natten_cpu(); \
+from allin1.models import load_pretrained_model; \
+load_pretrained_model('harmonix-all', device='cpu'); \
+from demucs.pretrained import get_model; \
+get_model('hdemucs_mmi'); \
+get_model('htdemucs')"
+
+# Runtime base: nvidia/cuda 12.1 on Ubuntu 22.04 instead of debian:bookworm.
+# Same userland (glibc 2.35 vs 2.36 — both new enough for our pixi-managed
+# Python 3.11 binaries built against conda-forge sysroot).
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=build /app/.pixi /app/.pixi
+COPY --from=build /opt/cache /opt/cache
+COPY --from=build /shell-hook /shell-hook
+COPY app/ ./app/
+COPY pixi.toml ./
+
+ENV PATH="/app/.pixi/envs/default/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+ENV HF_HOME=/opt/cache/huggingface
+ENV TORCH_HOME=/opt/cache/torch
+
+EXPOSE 8000
+
+ENTRYPOINT ["/bin/bash", "/shell-hook"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

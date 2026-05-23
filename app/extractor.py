@@ -256,10 +256,18 @@ def extract_sections(audio_path: str) -> dict:
     # import so /health and the lighter endpoints aren't dragged into its
     # startup cost.
     import allin1
+    import torch
 
     _patch_allin1_demix()
 
     duration = _probe_duration(audio_path)
+
+    # Auto-pick GPU if available — the same image build (CPU wheels) reports
+    # `is_available() == False`, so this stays a no-op for CPU deploys. On
+    # the GPU image variant (Dockerfile.gpu, CUDA wheels) it flips to
+    # 'cuda' transparently; the device flows through to Demucs's
+    # subprocess as well via our monkey-patched _demix.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # allin1 defaults demix_dir/spec_dir to ./demix and ./spec relative to
     # cwd. In an HTTP server that turns concurrent requests into a race over
@@ -274,7 +282,7 @@ def extract_sections(audio_path: str) -> dict:
             model=model_name,
             demix_dir=scratch_path / "demix",
             spec_dir=scratch_path / "spec",
-            device="cpu",
+            device=device,
             keep_byproducts=False,
             # multiprocess spawns helper procs for spectrogram extraction.
             # Inside uvicorn's threadpool that adds fork overhead with no

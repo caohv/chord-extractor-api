@@ -1,161 +1,139 @@
-# Benchmark chord-extractor-api /sections endpoint on Windows
+# Benchmark chord-extractor-api `/sections` on Windows
 
-## Mục tiêu
+> **Audience**: Claude Code instance running on a Windows 11 box with Docker Desktop + WSL2.
+> **Goal**: Measure `POST /sections` end-to-end latency on (1) CPU native amd64 and (2) RTX 3050 Ti GPU. Compare with the Apple Silicon / Rosetta baseline of 4:32.
+> **Time budget**: ~30-45 min first run (mostly Docker build + model download); ~5 min for subsequent benchmark requests.
 
-Đo thời gian thực tế của `POST /sections` trên máy Windows host (Intel i5 + RTX 3050 Ti) cho 1 audio YouTube ~4:29. Repo hiện tại đã verified chạy đúng dưới Docker Desktop trên Apple Silicon (Rosetta emulation: 4:32/request). Mục tiêu là đo:
+This document is self-contained. The repo already has both `Dockerfile` (CPU) and `Dockerfile.gpu` (GPU) pre-staged, and `app/extractor.py` auto-picks `device='cuda'` when available. No code edits needed — just clone, build, run, curl.
 
-1. **CPU native amd64** trên Windows Docker Desktop / WSL2 (kỳ vọng ~25-50s).
-2. **GPU CUDA** dùng RTX 3050 Ti (kỳ vọng ~10-15s, cần Dockerfile variant mới).
+## Test fixture
 
-## Stack đang dùng
-
-- Python 3.11 + FastAPI + uvicorn
-- `allin1==1.1.0` (music structure analyzer, ISMIR 2023) — single-fold model `harmonix-fold0` mặc định (8× nhanh hơn ensemble)
-- Demucs source separation — monkey-patched dùng `hdemucs_mmi` (nhanh hơn htdemucs 2-3×, RAM ~1 GB, không OOM trên 4 GB hosts)
-- PyTorch CPU 2.5.0 + torchaudio 2.5.0 + NATTEN 0.17.4 CPU wheel
-- Pixi (deps), Docker (deploy)
-
-Endpoint khác (`/extract`, `/bpm`, `/meter`) cũng tồn tại — không cần test cho mục tiêu này.
-
-## Test input — luôn dùng URL này để so sánh
+Use this YouTube URL every time so results are comparable across machines:
 
 ```
 https://www.youtube.com/watch?v=JgdXcwuggpU
 ```
 
-Track dài 269.28s (4:29). YouTube ID `JgdXcwuggpU`.
+Track is 269.28 s (4:29). YouTube ID `JgdXcwuggpU`. The known-good response has `duration=269.281814`, `bpm=107`, and 10-13 segments labeled from `{intro, verse, chorus, bridge, inst, solo, break, outro}`.
 
-## Expected response schema
+## Baseline to beat
 
-```json
-{
-  "duration": 269.281814,
-  "bpm": 107,
-  "beats": [/* ~370-400 floats */],
-  "downbeats": [/* ~95-105 floats */],
-  "segments": [
-    { "start": 19.49, "end": 37.87, "label": "verse" },
-    { "start": 37.87, "end": 55.65, "label": "intro" },
-    /* ... 10-13 segments, labels in: intro, verse, chorus, bridge, inst, solo, break, outro */
-  ]
-}
-```
+| Setup | Total `/sections` time | Notes |
+|---|---|---|
+| Apple Silicon Docker Desktop (Rosetta linux/amd64) | **4:32** | What was measured on Mac. Single-fold + hdemucs_mmi. |
+| Native amd64 CPU (this machine, Phase 1 below) | target ~25-50s | i5 cores, no emulation. |
+| RTX 3050 Ti CUDA (this machine, Phase 2 below) | target ~10-25s | GPU for both Demucs + allin1 model. |
 
-`bpm` luôn 107, `duration` luôn 269.28. Segments có thể khác nhẹ giữa các runs (model fold0 deterministic nhưng có vài boundary phụ thuộc input precision).
+If the numbers you measure are way off these targets, check the troubleshooting section.
 
----
-
-## Phase 1: CPU native amd64 trên Windows
-
-### Yêu cầu
-
-- Windows 11 (hoặc Windows 10 với WSL2)
-- Docker Desktop ≥ 4.30
-- WSL2 backend enabled trong Docker Desktop settings
-- Memory cấp cho Docker Desktop ≥ 6 GB (vì image runtime peak ~5 GB)
-- Free disk ≥ 8 GB (image 3.2 GB + scratch space)
-
-Verify:
+## Prerequisites (one-time)
 
 ```powershell
+# Verify Docker Desktop is on amd64 linux backend
 docker version
 docker info | Select-String -Pattern "Architecture|OSType|Total Memory"
 ```
 
-Output cần: `OSType: linux`, `Architecture: x86_64`. Total Memory ≥ 6 GiB.
+Required:
+- `OSType: linux`, `Architecture: x86_64`.
+- Docker Desktop Memory ≥ 6 GiB (Settings → Resources → Memory). The CPU image peaks ~5 GiB during Demucs.
+- Free disk ≥ 12 GiB (CPU image 3.2 GiB + GPU image ~7 GiB + scratch).
 
-### Get the code
+For Phase 2 (GPU) additionally:
+- NVIDIA driver ≥ 535 on Windows host.
+- Docker Desktop GPU support enabled (it auto-detects when driver is present; verify with the test below).
 
-Repo path local: `~/Workspace/weebuild/chord-extractor-api` trên Mac của user. Có 2 cách bring code sang Windows:
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+```
 
-**Cách A — clone từ git remote (nếu user đã push)**:
+Expected output: a table that mentions `NVIDIA GeForce RTX 3050 Ti` and a CUDA version. If you get `could not select device driver "" with capabilities: [[gpu]]`, see troubleshooting before continuing.
+
+## Get the code
 
 ```powershell
 cd $env:USERPROFILE
-git clone <repo-url> chord-extractor-api
+git clone -b feat/meter-endpoint git@github.com:caohv/chord-extractor-api.git
 cd chord-extractor-api
 ```
 
-Branch cần là branch hiện tại của user (chứa monkey-patch hdemucs_mmi và env var ALLIN1_MODEL). Hỏi user nếu chưa rõ branch.
+(If SSH isn't set up, swap to HTTPS: `git clone -b feat/meter-endpoint https://github.com/caohv/chord-extractor-api.git`.)
 
-**Cách B — copy qua mạng**:
+Both `Dockerfile` and `Dockerfile.gpu` are at the repo root. `WINDOWS_BENCHMARK.md` is the file you're reading now.
 
-User zip thư mục từ Mac:
+---
 
-```bash
-# Trên Mac
-cd ~/Workspace/weebuild
-zip -r chord-extractor-api.zip chord-extractor-api -x 'chord-extractor-api/.pixi/*' 'chord-extractor-api/.git/*'
-```
+## Phase 1 — CPU native amd64
 
-Transfer zip sang Windows (USB / iCloud / scp / cloud sync). Trên Windows:
+### Build
 
 ```powershell
-Expand-Archive .\chord-extractor-api.zip $env:USERPROFILE\
-cd $env:USERPROFILE\chord-extractor-api
-```
-
-### Build image (CPU)
-
-```powershell
-cd $env:USERPROFILE\chord-extractor-api
 docker buildx build --platform linux/amd64 -t chord-extractor-api:cpu .
 ```
 
-Build time ước **15-25 phút lần đầu** (download PyTorch CPU 2.5.0 ~190 MB + NATTEN wheel + allin1 + Demucs + transitives ~600 MB, prefetch model weights ~330 MB). Lần sau cached lại 1-2 phút.
+Expected build time: **15-25 min** first run (PyTorch CPU wheel ~190 MB + NATTEN wheel + allin1/demucs + ~330 MB of prefetched model weights). Subsequent builds with no code change are cached and finish in <30 s.
 
-Lưu ý: `--platform linux/amd64` quan trọng vì Dockerfile pin NATTEN wheel cho `linux_x86_64`. Nếu thiếu flag và Docker chọn arm64 thì sẽ fail.
+If the build dies during the prefetch step with `Trying to use DiffQ, but diffq is not installed`, your local Dockerfile is out of date — `git pull` and rebuild.
 
-### Run container
+### Run
 
 ```powershell
 docker rm -f chord-test 2>$null
 docker run -d --name chord-test --platform linux/amd64 -p 8000:8000 chord-extractor-api:cpu
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 4
 Invoke-RestMethod -Uri http://localhost:8000/health
 ```
 
-Expected: `@{status=ok}`.
-
-Verify route registered:
+Expected: `@{status=ok}`. Confirm the `/sections` route registered:
 
 ```powershell
-Invoke-RestMethod -Uri http://localhost:8000/openapi.json | ConvertTo-Json -Depth 5 | Select-String "/sections"
+(Invoke-RestMethod -Uri http://localhost:8000/openapi.json).paths.PSObject.Properties.Name
 ```
 
-### Run /sections benchmark
+Expected output includes `/sections`. If only the 4 old routes show, the image was built from the wrong branch.
+
+### Benchmark
 
 ```powershell
 $body = '{"url": "https://www.youtube.com/watch?v=JgdXcwuggpU"}'
 $start = Get-Date
 $resp = Invoke-RestMethod -Uri http://localhost:8000/sections `
-    -Method POST `
-    -ContentType "application/json" `
-    -Body $body `
-    -TimeoutSec 600
+    -Method POST -ContentType "application/json" -Body $body -TimeoutSec 600
 $elapsed = (Get-Date) - $start
-Write-Host "Elapsed: $($elapsed.TotalSeconds)s"
-$resp | ConvertTo-Json -Depth 10 | Out-File C:\temp\sections-cpu.json
-Write-Host "duration: $($resp.duration), bpm: $($resp.bpm)"
-Write-Host "beats: $($resp.beats.Count), downbeats: $($resp.downbeats.Count)"
-Write-Host "segments:"
+"`nElapsed: $([math]::Round($elapsed.TotalSeconds, 1))s`n"
+"duration: $($resp.duration)"
+"bpm: $($resp.bpm)"
+"beats: $($resp.beats.Count), downbeats: $($resp.downbeats.Count)"
+"segments:"
 $resp.segments | ForEach-Object { "  {0,7:N2} - {1,7:N2}  {2}" -f $_.start, $_.end, $_.label }
+$resp | ConvertTo-Json -Depth 10 | Out-File $env:TEMP\sections-cpu.json
 ```
 
-### Expected timing (CPU)
+Sanity check the response: `duration` must be `269.281814`, `bpm` must be `107`. If those are off, the audio download is broken (geo-block? rate limit?) — re-run after a minute or report the error and stop.
 
-- i5 cores hiện đại (8 cores, 3+ GHz, AVX2): **~25-50s** total
-- Trên các CPU yếu hơn (i5 thế hệ 8/9, 4 cores): có thể 60-90s
+### What to capture for the report
 
-Log break-down (bằng `docker logs chord-test`):
+```powershell
+"Image size: $((docker image ls chord-extractor-api:cpu --format '{{.Size}}'))"
+docker stats --no-stream chord-test
+```
 
-- `Separated tracks will be stored in /tmp/allin1-XXX/demix/hdemucs_mmi` → Demucs hdemucs_mmi đã được patch đúng
-- `100%|██████████| 274.95/274.95 [00:XX<00:00, ...seconds/s]` → Demucs done; mong đợi ~15-30s
-- `Extracting spectrograms: 100%|██████████| 1/1 [00:0X<00:00, ...]` → spec extraction ~1-2s
-- Sau đó ~132 NATTEN deprecation warnings (single-fold đúng) → model inference ~10-25s
-- Cuối cùng `INFO: ... POST /sections HTTP/1.1 200 OK`
+Also grep the container logs for the Demucs and model timings:
 
-### Stop container
+```powershell
+docker logs chord-test 2>&1 | Select-String -Pattern "Separated tracks|274.95/274.95|Extracting spectrograms.*100%|POST /sections"
+```
+
+Expected pattern from the Apple Silicon run (slower on Mac, your Windows numbers should compress these):
+
+```
+Separated tracks will be stored in /tmp/allin1-XXX/demix/hdemucs_mmi
+... 100%|██████████| 274.95/274.95 [01:55<00:00, ...] # Demucs ~2 min on Mac, expect ~15-30s on i5
+Extracting spectrograms: 100%|██████████| 1/1 [00:04<00:00, ...]
+INFO: ... "POST /sections HTTP/1.1" 200 OK
+```
+
+### Stop
 
 ```powershell
 docker rm -f chord-test
@@ -163,128 +141,45 @@ docker rm -f chord-test
 
 ---
 
-## Phase 2: GPU CUDA trên RTX 3050 Ti
+## Phase 2 — GPU CUDA on RTX 3050 Ti
 
-### Yêu cầu thêm so với Phase 1
-
-- NVIDIA driver ≥ 535 trên Windows host
-- WSL2 với NVIDIA CUDA support (Windows 11 hoặc Win10 21H2+ đã có sẵn)
-- NVIDIA Container Toolkit cài qua Docker Desktop hoặc manually trong WSL2
-
-Verify GPU accessible từ Docker:
+### Build
 
 ```powershell
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
-```
-
-Output cần show GPU `NVIDIA GeForce RTX 3050 Ti` với CUDA Version.
-
-Nếu fail: setup [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/) trước.
-
-### Tạo Dockerfile.gpu
-
-Trong thư mục repo, copy `Dockerfile` thành `Dockerfile.gpu` và apply các thay đổi sau:
-
-**Diff cần áp dụng**:
-
-```diff
-@@ stage 2: runtime base @@
--FROM debian:bookworm-slim
-+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
- RUN apt-get update && apt-get install -y --no-install-recommends \
-     libsndfile1 ffmpeg \
-     && rm -rf /var/lib/apt/lists/*
-
-@@ stage 1: pip install layer @@
- RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir \
--        --index-url https://download.pytorch.org/whl/cpu \
-+        --index-url https://download.pytorch.org/whl/cu121 \
-         --extra-index-url https://pypi.org/simple \
-         torch==2.5.0 torchaudio==2.5.0 \
-  && /app/.pixi/envs/default/bin/pip install --no-cache-dir \
--        https://github.com/SHI-Labs/NATTEN/releases/download/v0.17.4/natten-0.17.4%2Btorch250cpu-cp311-cp311-linux_x86_64.whl \
-+        https://github.com/SHI-Labs/NATTEN/releases/download/v0.17.4/natten-0.17.4%2Btorch250cu121-cp311-cp311-linux_x86_64.whl \
-  && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq
-```
-
-(2 thay đổi nhỏ: index URL cpu→cu121, NATTEN wheel cpu→cu121. Base image debian→nvidia/cuda.)
-
-Lưu ý: KHÔNG thay đổi prefetch step — model load với device='cpu' vẫn OK ở build time, runtime sẽ dùng cuda.
-
-### Sửa code để dùng CUDA runtime
-
-File `app/extractor.py`, function `extract_sections`, hiện tại có:
-
-```python
-result = allin1.analyze(
-    audio_path,
-    model=model_name,
-    demix_dir=scratch_path / "demix",
-    spec_dir=scratch_path / "spec",
-    device="cpu",   # ← hardcoded
-    keep_byproducts=False,
-    multiprocess=False,
-)
-```
-
-Thay `device="cpu"` thành:
-
-```python
-import torch
-device = "cuda" if torch.cuda.is_available() else "cpu"
-```
-
-Và:
-
-```python
-result = allin1.analyze(
-    audio_path,
-    model=model_name,
-    demix_dir=scratch_path / "demix",
-    spec_dir=scratch_path / "spec",
-    device=device,
-    keep_byproducts=False,
-    multiprocess=False,
-)
-```
-
-Trong monkey-patch `_demix` (cùng file), `--device` arg cũng cần dùng `device` được truyền vào — code hiện tại đã làm đúng vì nó dùng `str(device)`.
-
-### Bỏ NATTEN CUDA-probe stub khi có CUDA
-
-Function `_patch_natten_cpu()` chỉ stub `torch.cuda.get_device_capability` nếu `torch.cuda.is_available()` == False. Trên GPU host, `is_available()` returns True → stub không apply → NATTEN dùng path thật. OK không cần đổi.
-
-### Build GPU image
-
-```powershell
-cd $env:USERPROFILE\chord-extractor-api
 docker buildx build --platform linux/amd64 -f Dockerfile.gpu -t chord-extractor-api:gpu .
 ```
 
-Build time **~25-40 phút** lần đầu. PyTorch CUDA wheel ~2.5 GB là khoản nặng nhất.
+Expected build time: **25-40 min** first run (PyTorch CUDA wheel ~2.5 GB is the largest layer). Cached layers from the CPU build don't help here — `Dockerfile.gpu` uses a different runtime base (`nvidia/cuda:12.1.0-runtime-ubuntu22.04`) and pulls CUDA-tagged wheels.
 
-Image size dự kiến: **6-8 GB**.
+Image size: **6-8 GB**.
 
-### Run với --gpus all
+### Run
 
 ```powershell
 docker rm -f chord-test 2>$null
 docker run -d --name chord-test --platform linux/amd64 --gpus all -p 8000:8000 chord-extractor-api:gpu
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 4
 Invoke-RestMethod -Uri http://localhost:8000/health
 ```
 
-Verify GPU detected từ inside container:
+### Verify GPU is actually live inside the container
 
 ```powershell
-docker exec chord-test /app/.pixi/envs/default/bin/python -c "import torch; print('cuda available:', torch.cuda.is_available()); print('device count:', torch.cuda.device_count()); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+docker exec chord-test /app/.pixi/envs/default/bin/python -c "import torch; print('cuda_available:', torch.cuda.is_available()); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'); print('mem total:', round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2), 'GB' if torch.cuda.is_available() else '')"
 ```
 
-Expected: `cuda available: True`, device `NVIDIA GeForce RTX 3050 Ti`.
+Expected:
+```
+cuda_available: True
+device: NVIDIA GeForce RTX 3050 Ti
+mem total: 4.0 GB
+```
 
-### Run /sections benchmark GPU
+If `cuda_available: False`, the `--gpus all` flag didn't take effect — check Docker Desktop GPU integration.
 
-Same command as CPU phase. Save kết quả vào file khác:
+### Benchmark
+
+Same script as Phase 1, but save to a different file. Also kick off `nvidia-smi` in a parallel pane to capture GPU utilization during inference (optional, nice-to-have):
 
 ```powershell
 $body = '{"url": "https://www.youtube.com/watch?v=JgdXcwuggpU"}'
@@ -292,158 +187,135 @@ $start = Get-Date
 $resp = Invoke-RestMethod -Uri http://localhost:8000/sections `
     -Method POST -ContentType "application/json" -Body $body -TimeoutSec 300
 $elapsed = (Get-Date) - $start
-Write-Host "Elapsed (GPU): $($elapsed.TotalSeconds)s"
-$resp | ConvertTo-Json -Depth 10 | Out-File C:\temp\sections-gpu.json
+"`nElapsed (GPU): $([math]::Round($elapsed.TotalSeconds, 1))s`n"
+"duration: $($resp.duration), bpm: $($resp.bpm)"
+$resp | ConvertTo-Json -Depth 10 | Out-File $env:TEMP\sections-gpu.json
 ```
 
-### Expected timing (GPU 3050 Ti)
+In another PowerShell tab during the request:
 
-- Demucs hdemucs_mmi CUDA: **~3-7s**
-- Model single-fold CUDA: **~3-7s**
-- yt-dl + spec + response: ~5-10s
-- **Tổng: ~10-25s** (dao động phụ thuộc GPU load, network cho yt-dl)
+```powershell
+# Watch GPU utilization; Ctrl+C when /sections returns
+while ($true) { nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader; Start-Sleep 1 }
+```
 
-Log breakdown:
+### Stop
 
-- `Separated tracks will be stored in /tmp/.../hdemucs_mmi` ✓
-- `Selected model is a bag of 1 models` ✓
-- Demucs progress bar ~5s thay vì 30s ✓
-- KHÔNG còn `WARNING:natten.functional:You're calling NATTEN op natten1dav, which is deprecated` (CUDA path không qua deprecation shim trong NATTEN 0.17.4) ← hoặc vẫn có nhưng nhanh
-- Model inference dưới 10s
+```powershell
+docker rm -f chord-test
+```
 
 ---
 
-## Báo cáo kết quả
+## Reporting back
 
-Sau khi chạy xong cả 2 phases, output cần collect:
-
-1. **Phase 1 (CPU)**:
-   - `Elapsed: XXs`
-   - Image size: `docker image ls chord-extractor-api:cpu --format '{{.Size}}'`
-   - Container memory peak: chạy `docker stats --no-stream chord-test` giữa lúc inference
-   - First 5 segments + label distribution
-
-2. **Phase 2 (GPU)**:
-   - `Elapsed: XXs`
-   - Image size: `docker image ls chord-extractor-api:gpu --format '{{.Size}}'`
-   - GPU utilization: chạy `nvidia-smi` giữa lúc inference từ Windows host
-   - Verify `torch.cuda.is_available()` returned True
-   - Confirm BPM/duration giống CPU run (sanity check)
-
-Format report:
+Capture both phase results in this format and reply with it:
 
 ```
-CPU run:
-  Elapsed: 33.4s
-  Image: 3.2 GB
-  Peak mem: 1.8 GiB
-  Sample segments: [intro 0-19, verse 19-37, ...]
+== Phase 1 (CPU) ==
+Host: <i5 model, clock>
+Docker mem allocation: <X GB>
+Build time: <Y min>
+Image size: 3.2 GB
+/sections elapsed: <Z>s
+Demucs wall-clock: ~<a>s (from tqdm 274.95/274.95)
+Spec extraction: ~<b>s
+Model inference: ~<c>s (estimate from POST end minus prior stages)
+Container mem peak: <d> GiB
+Sanity: bpm=107 ✓, duration=269.28 ✓
+First 3 segments: [label,start,end x3]
 
-GPU run:
-  Elapsed: 12.1s
-  Image: 7.1 GB
-  GPU util peak: 78%
-  CUDA detected: True
-  Same BPM/duration: ✓
+== Phase 2 (GPU) ==
+GPU: NVIDIA GeForce RTX 3050 Ti (4 GB VRAM)
+Driver: <version>
+Build time: <Y min>
+Image size: <X> GB
+cuda_available inside container: True ✓
+/sections elapsed: <Z>s
+GPU util peak: <%>
+GPU mem used peak: <X> MB
+Sanity: bpm=107 ✓, duration=269.28 ✓
+
+== Comparison vs Apple Silicon Rosetta (4:32) ==
+CPU speedup: <X>×
+GPU speedup: <X>×
+```
+
+Also paste the full JSON of one run (CPU is fine) so we can sanity-check the segments shape:
+
+```powershell
+Get-Content $env:TEMP\sections-cpu.json | Select-Object -First 100
 ```
 
 ---
 
 ## Troubleshooting
 
-### CPU phase
+### Build fails with `no matching manifest for linux/arm64`
 
-**Build fails với "no matching manifest for linux/arm64"**
-
-Bạn quên `--platform linux/amd64`. Thêm vào docker build hoặc set env:
+You're on a Windows ARM host (unusual) or the docker daemon defaulted to arm. Force amd64:
 
 ```powershell
 $env:DOCKER_DEFAULT_PLATFORM = "linux/amd64"
 ```
 
-**Container exits with SIGKILL after few seconds**
+Then rebuild. If the host is genuinely ARM (Surface Pro X / Snapdragon), this image won't run — NATTEN wheel is `linux_x86_64` only.
 
-OOM. Tăng Docker Desktop memory: Settings → Resources → Memory ≥ 6 GB. Restart Docker Desktop.
+### `docker run` exits seconds after start
 
-**`/sections` returns 500 with "Extraction failed"**
+Container OOMed. Increase Docker Desktop memory: Settings → Resources → Memory → ≥ 6 GB. Restart Docker Desktop and re-run.
 
-Check `docker logs chord-test`. Common:
-- `subprocess.CalledProcessError ... <Signals.SIGKILL: 9>`: Demucs subprocess OOM
-- `ImportError ... natten.functional`: NATTEN wheel không match torch version (rebuild)
-- `ImportError ... MutableSequence from collections`: madmom compat patch không apply (kiểm tra extractor.py có gọi `_patch_madmom_compat()` và `_patch_natten_cpu()` trước `import allin1`)
+### `/sections` returns HTTP 500
 
-**yt-dlp download fails 403**
+`docker logs chord-test 2>&1 | Select-String -Pattern "Error|Traceback" -Context 0,10`
 
-YouTube đôi khi block server IPs. Update yt-dlp trong image bằng cách rebuild với:
+Common errors:
+- `subprocess.CalledProcessError ... <Signals.SIGKILL: 9>`: Demucs OOMed mid-separation. Same fix as above.
+- `ImportError: cannot import name 'natten1dav'`: NATTEN version mismatch with torch. The image's pip layer is out of sync — `git pull && docker build` again.
+- `ImportError ... MutableSequence`: madmom compat patch didn't apply. Sanity-check that `app/extractor.py` is the one from this branch (should contain `_patch_madmom_compat` and call it inside `extract_sections`).
 
-```dockerfile
-&& /app/.pixi/envs/default/bin/pip install --no-cache-dir -U yt-dlp
+### yt-dlp fails with HTTP 403 or "Sign in to confirm you're not a bot"
+
+YouTube rate-limited / IP-blocked the request. Wait 30 min and retry, or pre-download the audio file once on the host and serve it from a local URL (e.g. `python -m http.server` in another dir) to skip yt-dlp.
+
+### Phase 2: `docker run --gpus all` fails with `could not select device driver`
+
+NVIDIA Container Toolkit isn't wired into Docker Desktop. In Docker Desktop:
+1. Settings → Resources → WSL Integration → enable for your default WSL distro.
+2. In that WSL distro, ensure `nvidia-container-toolkit` is installed:
+   ```bash
+   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+   sudo apt-get update
+   sudo apt-get install -y nvidia-container-toolkit
+   ```
+3. Restart Docker Desktop.
+
+### Phase 2: `cuda_available: False` inside the container
+
+- Confirm host `nvidia-smi` works (driver loaded).
+- Confirm `docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi` works (toolkit OK).
+- Confirm the image was built from `Dockerfile.gpu` and not `Dockerfile`: `docker exec chord-test pip show torch | findstr "Version Location"` — version must read `2.5.0+cu121` (cpu build would say `2.5.0+cpu`).
+
+### Phase 2: Out of GPU memory (3050 Ti has only 4 GB VRAM)
+
+`torch.OutOfMemoryError: CUDA out of memory`. Single-fold allin1 + hdemucs_mmi typically peaks ~2.5 GB, so 4 GB should fit. But other processes can hold VRAM (browser hardware accel, Discord, games). Check from Windows host:
+
+```powershell
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv
 ```
 
-Thêm vào pip install layer.
-
-### GPU phase
-
-**`docker run --gpus all` fails với "could not select device driver"**
-
-NVIDIA Container Toolkit chưa setup trên Docker Desktop WSL2. Fix:
-
-```bash
-# Trong WSL2 distro
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
-sudo systemctl restart docker
-```
-
-Hoặc enable trong Docker Desktop: Settings → Resources → WSL Integration → enable distro that has nvidia-container-toolkit.
-
-**`torch.cuda.is_available()` returns False inside container**
-
-- Check `nvidia-smi` chạy được từ container chưa: `docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi`
-- Verify base image trong Dockerfile.gpu là `nvidia/cuda:12.1.0-runtime-ubuntu22.04` (không phải debian)
-- Verify torch installed có CUDA: `docker exec chord-test pip show torch | findstr Version` should show `2.5.0+cu121`
-
-**NATTEN CUDA kernels missing — fallback to Triton**
-
-Có thể thấy log: `_IS_TRITON_SUPPORTED = ... < 70` cho 3050 Ti (compute capability 8.6). Triton support cần GPU CC ≥ 7.0; 3050 Ti = 8.6 nên OK. Nếu NATTEN vẫn fall back, kiểm tra triton package có installed: `docker exec chord-test pip show triton`. Nếu thiếu: thêm `triton` vào pip install layer.
-
-**Out of GPU memory (3050 Ti có 4 GB VRAM)**
-
-`torch.OutOfMemoryError: CUDA out of memory`. hdemucs_mmi + single-fold allin1 nên fit trong 4 GB, nhưng nếu fail:
-- Đảm bảo không có process khác chiếm VRAM trên Windows (close games, browser hardware accel có thể chiếm 1-2 GB)
-- Thử `--device cpu` cho 1 stage (vd: model run CPU, demucs run CUDA): sửa code passes device khác nhau
+If >1 GB is already used at idle, close apps until free memory is ≥ 3.5 GB before retrying.
 
 ---
 
-## Reference — code change summary của repo này
+## Reference — what's in this repo
 
-3 thay đổi chính so với upstream:
+- `app/main.py` — FastAPI routes. `/sections` calls `extract_sections` via `run_in_threadpool`.
+- `app/extractor.py:extract_sections` — orchestrates: madmom + NATTEN compat patches → monkey-patch allin1's hardcoded `htdemucs` → `hdemucs_mmi` → auto-pick `device='cuda' if torch.cuda.is_available() else 'cpu'` → call `allin1.analyze()` in a per-request tempdir.
+- `app/schemas.py:SectionsResponse` — `{duration, bpm, beats, downbeats, segments[start,end,label]}`.
+- `Dockerfile` — CPU image. Pixi env + pip layer (torch CPU 2.5.0, NATTEN 0.17.4 CPU, allin1 1.1.0, diffq). Prefetches harmonix-all (8 folds), hdemucs_mmi, htdemucs.
+- `Dockerfile.gpu` — same structure, swaps to PyTorch + NATTEN CUDA 12.1 wheels and `nvidia/cuda:12.1.0-runtime-ubuntu22.04` runtime base.
+- `ALLIN1_MODEL` env var — defaults to `harmonix-fold0` (single fold). Set to `harmonix-all` for the 8-fold ensemble (~8× slower, ~1-3 F1 better).
 
-1. **`app/extractor.py`** — thêm `extract_sections()`:
-   - Lazy import allin1
-   - Apply 2 compat patches trước import: `_patch_madmom_compat()` (Python 3.11 / numpy compat) và `_patch_natten_cpu()` (stub `torch.cuda.get_device_capability` cho CPU torch — không cần trên GPU host)
-   - Monkey-patch `allin1.demix.demix` và `allin1.analyze.demix` qua `sys.modules` (vì `allin1/__init__.py` shadows `allin1.analyze` thành function nên `import allin1.analyze` không cho ta module reference)
-   - Default model `harmonix-fold0` (single-fold, 8× nhanh hơn ensemble); override qua env `ALLIN1_MODEL=harmonix-all` để dùng ensemble
-   - Demucs forced `hdemucs_mmi` (không config được, nếu cần htdemucs phải edit code)
-   - Pass tempdir cho `demix_dir`/`spec_dir` để cô lập concurrent requests
-   - `multiprocess=False` (tránh fork overhead trong uvicorn threadpool)
-   - Drop nhãn `start`/`end` ra khỏi response (silence markers, không có ý nghĩa cấu trúc)
-
-2. **`app/schemas.py`** — `SectionsResponse` shape:
-   ```python
-   class SectionsResponse(BaseModel):
-       duration: float
-       bpm: int
-       beats: list[float]
-       downbeats: list[float]
-       segments: list[Section]
-   ```
-
-3. **`app/main.py`** — route `POST /sections` (same pattern as existing `/extract`, `/bpm`, `/meter`).
-
-4. **`Dockerfile`** — multi-stage:
-   - Build stage: pixi env + pip layer (torch CPU 2.5.0, NATTEN 0.17.4 CPU wheel, allin1, diffq)
-   - Prefetch model weights: harmonix-all (8 folds → ~80 MB) + hdemucs_mmi (~80 MB) + htdemucs (~250 MB fallback)
-   - Runtime: copy env + cache, env vars `HF_HOME=/opt/cache/huggingface`, `TORCH_HOME=/opt/cache/torch`
-
-Image hiện tại 3.2 GB (CPU). GPU variant dự kiến 6-8 GB.
+If you need to dig deeper, the comments in `app/extractor.py` document why each patch exists (NATTEN's CUDA-probe at CPU import, allin1's `from .analyze import analyze` shadowing the module, mdx_q's 4-model-bag OOM behavior we rejected, etc).
