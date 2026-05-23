@@ -1,5 +1,8 @@
 import json
+import os
 import subprocess
+import tempfile
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -7,6 +10,17 @@ from chord_extractor.extractors import Chordino
 
 SR = 22050
 BPM_SAMPLE_SECONDS = 60.0
+
+# allin1 filters its 10 raw HARMONIX labels down to functional sections; the
+# `start`/`end` markers wrap leading/trailing silence and aren't musically
+# meaningful, so they're dropped before returning.
+_DROPPED_SECTION_LABELS = {"start", "end"}
+
+# allin1's `harmonix-all` ensembles 8 fold checkpoints; on CPU that's ~8× the
+# inference time of a single fold for ~1-3 F1 points of accuracy. Default to a
+# single fold for latency; opt into the ensemble by setting
+# `ALLIN1_MODEL=harmonix-all` in the environment.
+_DEFAULT_ALLIN1_MODEL = "harmonix-fold0"
 
 
 def _probe_duration(audio_path: str) -> float:
@@ -153,4 +167,132 @@ def extract_chords(audio_path: str) -> dict:
             {"chord": c.chord, "timestamp": float(c.timestamp)}
             for c in raw
         ],
+    }
+
+
+def _patch_natten_cpu() -> None:
+    # NATTEN 0.17.5's CPU wheel still probes torch.cuda.get_device_capability
+    # at import time to detect Triton support, which raises on CPU-only
+    # PyTorch ("Torch not compiled with CUDA enabled"). Stub it to a
+    # below-Triton-threshold value so the import sees no Triton.
+    import torch
+
+    if not torch.cuda.is_available():
+        torch.cuda.get_device_capability = lambda *_a, **_k: (0, 0)
+
+
+def _patch_allin1_demix() -> None:
+    # allin1.demix.demix shells out to `python -m demucs.separate --name
+    # htdemucs` and reads back stems from `<demix_dir>/htdemucs/<stem>/*.wav`.
+    # htdemucs is the slowest demucs variant; on CPU it dominates /sections
+    # wall-clock. hdemucs_mmi (the pre-transformer Hybrid Demucs) is ~2×
+    # faster on CPU, ~80 MB instead of ~250 MB, ~1 SDR less separation
+    # quality — still enough for downstream structural analysis. We chose
+    # hdemucs_mmi over mdx_q because mdx_q is a 4-model bag that loads all
+    # sub-models in parallel and peaks RAM at ~6 GB, OOM-ing on hosts with
+    # <8 GB (e.g. Cloudflare Containers standard-1 = 4 GB). hdemucs_mmi is
+    # a single model and stays around ~1 GB peak, matching htdemucs's
+    # memory profile. We swap both the CLI flag and the expected output
+    # subdir, leaving everything else (4-stem layout) intact.
+    #
+    # Reach for the modules via sys.modules — allin1/__init__.py runs
+    # `from .analyze import analyze`, which clobbers the `allin1.analyze`
+    # *attribute* (it now refers to the function, not the submodule). The
+    # `from .demix import demix` inside `allin1.analyze` then binds `demix`
+    # into the analyze module's namespace; rebinding that namespace entry
+    # via sys.modules is what actually swaps the function the patched
+    # analyze() will call.
+    import subprocess
+    import sys
+
+    import allin1.analyze  # noqa: F401  — populates sys.modules
+    import allin1.demix  # noqa: F401  — populates sys.modules
+
+    demix_module = sys.modules["allin1.demix"]
+    analyze_module = sys.modules["allin1.analyze"]
+
+    if getattr(demix_module.demix, "_demix_patched", False):
+        return
+
+    def _demix(paths, demix_dir, device):
+        model_name = "hdemucs_mmi"
+        todos: list = []
+        demix_paths: list = []
+        for path in paths:
+            out_dir = demix_dir / model_name / path.stem
+            demix_paths.append(out_dir)
+            if out_dir.is_dir() and all(
+                (out_dir / f"{s}.wav").is_file()
+                for s in ("bass", "drums", "other", "vocals")
+            ):
+                continue
+            todos.append(path)
+        if todos:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "demucs.separate",
+                    "--out", demix_dir.as_posix(),
+                    "--name", model_name,
+                    "--device", str(device),
+                    *[p.as_posix() for p in todos],
+                ],
+                check=True,
+            )
+        return demix_paths
+
+    _demix._demix_patched = True  # type: ignore[attr-defined]
+    demix_module.demix = _demix
+    analyze_module.demix = _demix
+
+
+def extract_sections(audio_path: str) -> dict:
+    # allin1 imports madmom via its spectrogram module, so we hit the same
+    # Python 3.10+/numpy compat issues as extract_meter. Patch before the
+    # import chain runs. NATTEN's CPU import also needs a CUDA-probe stub.
+    _patch_madmom_compat()
+    _patch_natten_cpu()
+
+    # allin1 (PyTorch + Demucs + neighborhood-attention model) is heavy; lazy
+    # import so /health and the lighter endpoints aren't dragged into its
+    # startup cost.
+    import allin1
+
+    _patch_allin1_demix()
+
+    duration = _probe_duration(audio_path)
+
+    # allin1 defaults demix_dir/spec_dir to ./demix and ./spec relative to
+    # cwd. In an HTTP server that turns concurrent requests into a race over
+    # shared scratch dirs; isolate each call in its own tempdir and let
+    # keep_byproducts=False clean up.
+    model_name = os.environ.get("ALLIN1_MODEL") or _DEFAULT_ALLIN1_MODEL
+
+    with tempfile.TemporaryDirectory(prefix="allin1-") as scratch:
+        scratch_path = Path(scratch)
+        result = allin1.analyze(
+            audio_path,
+            model=model_name,
+            demix_dir=scratch_path / "demix",
+            spec_dir=scratch_path / "spec",
+            device="cpu",
+            keep_byproducts=False,
+            # multiprocess spawns helper procs for spectrogram extraction.
+            # Inside uvicorn's threadpool that adds fork overhead with no
+            # win on single-file requests, and risks issues under gunicorn
+            # workers — keep it single-process.
+            multiprocess=False,
+        )
+
+    segments = [
+        {"start": float(s.start), "end": float(s.end), "label": s.label}
+        for s in result.segments
+        if s.label not in _DROPPED_SECTION_LABELS
+    ]
+
+    return {
+        "duration": duration,
+        "bpm": int(result.bpm),
+        "beats": [float(b) for b in result.beats],
+        "downbeats": [float(b) for b in result.downbeats],
+        "segments": segments,
     }

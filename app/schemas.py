@@ -27,3 +27,17 @@ class MeterResponse(BaseModel):
     time_signature: str
     confidence: float
     downbeats: list[float]
+
+
+class Section(BaseModel):
+    start: float
+    end: float
+    label: str
+
+
+class SectionsResponse(BaseModel):
+    duration: float
+    bpm: int
+    beats: list[float]
+    downbeats: list[float]
+    segments: list[Section]
