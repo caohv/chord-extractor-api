@@ -28,6 +28,20 @@ RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir \
  && /app/.pixi/envs/default/bin/pip install --no-cache-dir allin1==1.1.0 diffq \
  && /app/.pixi/envs/default/bin/pip install --no-cache-dir faster-whisper
 
+# yt-dlp needs a JavaScript runtime to solve YouTube's player "JS challenges"
+# (nsig/sig descrambling, now required for a growing share of videos). Without
+# one, yt-dlp can't resolve a playable audio format for those videos and the
+# download fails with "This video is not available" — which surfaces as a 502
+# from /bpm (and /extract, /sections...). The `deno` PyPI package drops a
+# self-contained Deno binary into the env's bin dir (already on PATH in the
+# final image via the .pixi copy), and yt-dlp auto-detects it as its preferred
+# JS interpreter — no app code change needed. Pinned to match yt-dlp's own
+# `[deno]` extra (>=2.6.6). The `deno --version` call asserts the binary
+# actually runs, so a broken install fails the build instead of silently
+# shipping a JS-less image that 502s on challenge-gated videos.
+RUN /app/.pixi/envs/default/bin/pip install --no-cache-dir "deno>=2.6.6" \
+ && /app/.pixi/envs/default/bin/deno --version
+
 # Pre-fetch model weights so the first /sections request doesn't pay the
 # download cost. allin1's harmonix-all caches all 8 fold checkpoints
 # (~80 MB), which also covers any single `harmonix-foldN` selection.
