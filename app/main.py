@@ -1,8 +1,9 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .downloader import (
     DownloadError,
@@ -28,6 +29,16 @@ logger = logging.getLogger("chord-extractor-api")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Chord Extractor API", version="0.1.0")
+
+# Suffix -> Content-Type for the raw audio bytes returned by /download.
+_AUDIO_MEDIA_TYPES = {
+    "mp3": "audio/mpeg",
+    "m4a": "audio/mp4",
+    "webm": "audio/webm",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+}
 
 
 @app.get("/health")
@@ -73,6 +84,33 @@ async def sections(req: ExtractRequest) -> SectionsResponse:
     async with download_to_temp(url) as path:
         result = await run_in_threadpool(extract_sections, path, req.lyrics)
     return SectionsResponse(**result)
+
+
+@app.post("/download")
+async def download(req: ExtractRequest) -> Response:
+    """Download the source audio and return the raw bytes (no analysis).
+
+    Reuses the same yt-dlp ingestion as the analysis endpoints (Deno-backed
+    solving of YouTube's player-JS challenges), so callers can use this service
+    as a reliable YouTube->audio fetcher — e.g. to feed an external
+    alignment/transcription backend — instead of a third-party downloader.
+    The `Content-Type` and `X-Audio-Ext` header reflect the resolved format
+    (yt-dlp prefers m4a; direct URLs keep their original suffix).
+    """
+    url = str(req.url)
+    logger.info("download requested url=%s", url)
+    async with download_to_temp(url) as path:
+        p = Path(path)
+        ext = p.suffix.lstrip(".").lower() or "mp3"
+        data = await run_in_threadpool(p.read_bytes)
+    return Response(
+        content=data,
+        media_type=_AUDIO_MEDIA_TYPES.get(ext, "application/octet-stream"),
+        headers={
+            "Content-Disposition": f'attachment; filename="audio.{ext}"',
+            "X-Audio-Ext": ext,
+        },
+    )
 
 
 @app.exception_handler(UnsupportedFormatError)

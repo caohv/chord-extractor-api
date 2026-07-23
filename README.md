@@ -161,6 +161,18 @@ Error codes:
 - `502` — download failed (network error, YouTube unavailable, geo-block, age-gate, etc.)
 - `500` — extraction failed
 
+### `POST /download`
+Body: same as `/extract` (`{"url": ...}`). Runs only the ingestion step and streams back the **raw audio bytes** — no analysis. Uses the same yt-dlp pipeline (Deno-backed YouTube JS-challenge solving) as the analysis endpoints, so it doubles as a reliable YouTube→audio fetcher for external backends.
+
+Response is the audio file (not JSON): `Content-Type` is the resolved audio type (`audio/mp4` for yt-dlp's preferred m4a, or the original suffix for direct URLs) and `X-Audio-Ext` carries the bare extension (`m4a`, `mp3`, …). Same `413`/`415`/`422`/`502` error codes as above.
+
+```bash
+curl -X POST https://chord-extractor.tuner.vn/download \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.youtube.com/watch?v=..."}' \
+  -o audio.m4a
+```
+
 ## Local dev
 
 ### Recommended: run via Docker
