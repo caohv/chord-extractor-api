@@ -77,6 +77,24 @@ def _download_youtube_sync(url: str) -> str:
         "progress_hooks": [_hook],
     }
 
+    # From a datacenter IP, YouTube increasingly gates videos behind "Sign in to
+    # confirm you're not a bot" and only serves those formats to an
+    # authenticated session. Pass a cookies.txt (Netscape format, exported from
+    # a logged-in YouTube account) via YTDLP_COOKIES_FILE to authenticate.
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookies_file and os.path.exists(cookies_file):
+        opts["cookiefile"] = cookies_file
+
+    # From a datacenter IP, YouTube's default `web` client trips the "Sign in to
+    # confirm you're not a bot" gate on most videos. The mobile/tv innertube
+    # clients don't (verified), so default to them — cookie-free. Override the
+    # comma list via YTDLP_PLAYER_CLIENT, or set it empty to use yt-dlp's default.
+    player_client = os.environ.get("YTDLP_PLAYER_CLIENT", "android,ios,tv")
+    if player_client:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": player_client.split(",")}
+        }
+
     try:
         with YoutubeDL(cast(Any, opts)) as ydl:
             ydl.download([url])

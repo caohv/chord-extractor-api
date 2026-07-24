@@ -34,6 +34,7 @@ app = FastAPI(title="Chord Extractor API", version="0.1.0")
 _AUDIO_MEDIA_TYPES = {
     "mp3": "audio/mpeg",
     "m4a": "audio/mp4",
+    "mp4": "audio/mp4",
     "webm": "audio/webm",
     "wav": "audio/wav",
     "ogg": "audio/ogg",
